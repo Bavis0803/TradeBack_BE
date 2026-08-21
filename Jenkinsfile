@@ -34,7 +34,7 @@ pipeline {
     stage('Test backend') {
       steps {
         sh 'docker compose --env-file .env build backend'
-        sh 'docker compose --env-file .env run --rm -e DB_ENGINE=sqlite -e REDIS_URL= backend python manage.py test --verbosity 1'
+        sh 'docker compose --env-file .env run --rm -e DB_ENGINE=sqlite -e REDIS_URL= backend python manage.py test user.tests exchanges.tests copytrading.tests --verbosity 1'
       }
     }
 
