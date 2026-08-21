@@ -15,7 +15,9 @@ pipeline {
     stage('Checkout frontend') {
       steps {
         dir('TradeBack_FE') {
-          git branch: 'main', url: 'https://github.com/Bavis0803/TradeBack_FE.git'
+          git branch: 'main',
+              credentialsId: 'tradeback-fe-deploy-key',
+              url: 'git@github.com:Bavis0803/TradeBack_FE.git'
         }
       }
     }
