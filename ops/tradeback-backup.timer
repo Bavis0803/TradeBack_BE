@@ -1,0 +1,10 @@
+[Unit]
+Description=Run TradeBack backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 Asia/Ho_Chi_Minh
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

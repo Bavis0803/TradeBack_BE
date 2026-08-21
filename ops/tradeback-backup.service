@@ -1,0 +1,8 @@
+[Unit]
+Description=TradeBack PostgreSQL and media backup
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/tradeback/TradeBack_BE/ops/backup.sh

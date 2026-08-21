@@ -10,8 +10,10 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+from datetime import timedelta
 from pathlib import Path
-from decouple import config
+
+from decouple import Csv, config
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -21,12 +23,21 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = config("SECRET_KEY")
+LEGACY_SECRET_KEY = config("SECRET_KEY", default="")
+SECRET_KEY = config("DJANGO_SECRET_KEY", default=LEGACY_SECRET_KEY)
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# Use a separate, stable secret in production. Changing it makes stored
+# exchange credentials unreadable, so manage it like a database password.
+EXCHANGE_CREDENTIAL_ENCRYPTION_KEY = config(
+    "EXCHANGE_CREDENTIAL_ENCRYPTION_KEY", default=LEGACY_SECRET_KEY or SECRET_KEY
+)
 
-ALLOWED_HOSTS = ["*"]
+# Production values are supplied by environment variables. Local development
+# remains available through the checked-in example configuration.
+DEBUG = config("DEBUG", cast=bool, default=False)
+ALLOWED_HOSTS = config(
+    "ALLOWED_HOSTS", cast=Csv(), default="localhost,127.0.0.1"
+)
 
 
 # Application definition
@@ -41,6 +52,10 @@ INSTALLED_APPS = [
     "rest_framework",
     "corsheaders",
     "user",
+    "exchanges",
+    "rest_framework_simplejwt",
+    "channels",
+    "copytrading",
 ]
 
 MIDDLEWARE = [
@@ -72,21 +87,32 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'tradeback.wsgi.application'
+ASGI_APPLICATION = 'tradeback.asgi.application'
 
 
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": config("DB_NAME"),
-        "USER": config("DB_USER"),
-        "PASSWORD": config("DB_PASSWORD"),
-        "HOST": config("DB_HOST"),
-        "PORT": config("DB_PORT"),
+if config("DB_ENGINE", default="postgresql") == "sqlite":
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
+        }
     }
-}
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": config("DB_NAME"),
+            "USER": config("DB_USER"),
+            "PASSWORD": config("DB_PASSWORD"),
+            "HOST": config("DB_HOST"),
+            "PORT": config("DB_PORT"),
+            "CONN_MAX_AGE": config("DB_CONN_MAX_AGE", cast=int, default=60),
+            "CONN_HEALTH_CHECKS": True,
+        }
+    }
 
 
 # Password validation
@@ -111,6 +137,18 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework_simplejwt.authentication.JWTAuthentication",
     ],
+    "DEFAULT_THROTTLE_CLASSES": [
+        "rest_framework.throttling.ScopedRateThrottle",
+    ],
+    "DEFAULT_THROTTLE_RATES": {
+        "binance_connection": "10/minute",
+        "binance_dashboard": "30/minute",
+        "copy_positions": "120/minute",
+        "transaction_log": "120/minute",
+        "transaction_sync": "6/minute",
+        "copy_trading": "60/minute",
+        "telegram_auth": "10/minute",
+    },
 }
 
 
@@ -129,14 +167,80 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
-STATIC_URL = 'static/'
-
-DEBUG = config("DEBUG", cast=bool)
+STATIC_URL = "/static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
+MEDIA_URL = "/media/"
 
 APPEND_SLASH=False
 
 AUTH_USER_MODEL = "user.User"
 
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-]
+CORS_ALLOWED_ORIGINS = config(
+    "CORS_ALLOWED_ORIGINS", cast=Csv(), default="http://localhost:3000"
+)
+CSRF_TRUSTED_ORIGINS = config("CSRF_TRUSTED_ORIGINS", cast=Csv(), default="")
+
+# Nginx terminates TLS in production and forwards the original scheme.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+SECURE_SSL_REDIRECT = config("SECURE_SSL_REDIRECT", cast=bool, default=False)
+SESSION_COOKIE_SECURE = config("SESSION_COOKIE_SECURE", cast=bool, default=not DEBUG)
+CSRF_COOKIE_SECURE = config("CSRF_COOKIE_SECURE", cast=bool, default=not DEBUG)
+SECURE_HSTS_SECONDS = config("SECURE_HSTS_SECONDS", cast=int, default=0)
+SECURE_HSTS_INCLUDE_SUBDOMAINS = SECURE_HSTS_SECONDS > 0
+SECURE_HSTS_PRELOAD = SECURE_HSTS_SECONDS > 0
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = "DENY"
+
+# A shared Redis layer is required when the Telegram worker and ASGI server run
+# as separate processes. In-memory remains convenient for tests and one-process
+# development; the frontend also polls as a reconnect fallback.
+REDIS_URL = config("REDIS_URL", default="")
+CACHES = {
+    "default": (
+        {
+            "BACKEND": "django_redis.cache.RedisCache",
+            "LOCATION": REDIS_URL,
+            "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
+        }
+        if REDIS_URL
+        else {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "tradeback-binance-cache",
+        }
+    )
+}
+CHANNEL_LAYERS = {
+    "default": (
+        {
+            "BACKEND": "channels_redis.core.RedisChannelLayer",
+            "CONFIG": {"hosts": [REDIS_URL]},
+        }
+        if REDIS_URL
+        else {"BACKEND": "channels.layers.InMemoryChannelLayer"}
+    )
+}
+
+COPY_TRADING_LIVE_ENABLED = config("COPY_TRADING_LIVE_ENABLED", cast=bool, default=False)
+COPY_TRADING_MAX_ALLOCATION_USDT = config(
+    "COPY_TRADING_MAX_ALLOCATION_USDT", cast=float, default=1000
+)
+COPY_TRADING_MEDIA_MAX_BYTES = config(
+    "COPY_TRADING_MEDIA_MAX_BYTES", cast=int, default=10 * 1024 * 1024
+)
+COPY_TRADING_SIGNAL_MAX_AGE_SECONDS = config(
+    "COPY_TRADING_SIGNAL_MAX_AGE_SECONDS", cast=int, default=300
+)
+MEDIA_ROOT = BASE_DIR / "media"
+
+LOG_LEVEL = config("LOG_LEVEL", default="INFO")
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "root": {"handlers": ["console"], "level": LOG_LEVEL},
+}
+
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),   # thời gian sống access token
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+}
