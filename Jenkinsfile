@@ -58,8 +58,8 @@ pipeline {
           for i in $(seq 1 20); do
             if curl -fsS "http://127.0.0.1:$port/health/" >/dev/null; then
               index_html=$(curl -fsS "http://127.0.0.1:$port/")
-              js_path=$(printf '%s' "$index_html" | grep -oE 'src="[^"]+\.js"' | head -1 | cut -d'"' -f2)
-              css_path=$(printf '%s' "$index_html" | grep -oE 'href="[^"]+\.css"' | head -1 | cut -d'"' -f2)
+              js_path=$(printf '%s' "$index_html" | grep -oE 'src="[^"]+[.]js"' | head -1 | cut -d'"' -f2)
+              css_path=$(printf '%s' "$index_html" | grep -oE 'href="[^"]+[.]css"' | head -1 | cut -d'"' -f2)
               if [ -n "$js_path" ] && [ -n "$css_path" ] \
                 && curl -fsS "http://127.0.0.1:$port$js_path" >/dev/null \
                 && curl -fsS "http://127.0.0.1:$port$css_path" >/dev/null; then
