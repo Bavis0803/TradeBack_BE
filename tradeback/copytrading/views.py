@@ -1,7 +1,7 @@
 from asgiref.sync import async_to_sync
 from decimal import Decimal
 from django.conf import settings
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
 from django.http import FileResponse, Http404
 from django.shortcuts import get_object_or_404
 from rest_framework import status
@@ -139,6 +139,58 @@ class StrategyMessagesAPIView(CopyTradingAPIView):
             "results": TelegramMessageSerializer(rows, many=True).data,
             "next_before": rows[-1].telegram_message_id if len(rows) == page_size else None,
         })
+
+
+class StrategyNotificationsAPIView(CopyTradingAPIView):
+    """Return and acknowledge messages not yet delivered to the user's notification UI."""
+
+    def get(self, request, strategy_id):
+        strategy = get_object_or_404(CopyStrategy, id=strategy_id, user=request.user)
+        try:
+            page_size = min(max(int(request.query_params.get("page_size", 50)), 1), 100)
+        except (TypeError, ValueError):
+            page_size = 50
+
+        rows = TelegramMessage.objects.filter(strategy=strategy)
+        if strategy.last_notified_message_id is None:
+            latest_id = rows.order_by("-telegram_message_id").values_list(
+                "telegram_message_id", flat=True
+            ).first()
+            if latest_id is not None:
+                CopyStrategy.objects.filter(pk=strategy.pk).update(
+                    last_notified_message_id=latest_id
+                )
+            return Response({"results": [], "has_more": False})
+
+        rows = list(
+            rows.filter(telegram_message_id__gt=strategy.last_notified_message_id)
+            .select_related("signal")
+            .prefetch_related("signal__executions")
+            .order_by("telegram_message_id")[: page_size + 1]
+        )
+        has_more = len(rows) > page_size
+        return Response({
+            "results": TelegramMessageSerializer(rows[:page_size], many=True).data,
+            "has_more": has_more,
+        })
+
+    def post(self, request, strategy_id):
+        strategy = get_object_or_404(CopyStrategy, id=strategy_id, user=request.user)
+        try:
+            message_id = int(request.data.get("telegram_message_id"))
+        except (TypeError, ValueError):
+            return Response({"detail": "telegram_message_id must be an integer."}, status=400)
+        if not TelegramMessage.objects.filter(
+            strategy=strategy, telegram_message_id=message_id
+        ).exists():
+            return Response({"detail": "Telegram message not found for this stream."}, status=400)
+
+        with transaction.atomic():
+            locked = CopyStrategy.objects.select_for_update().get(pk=strategy.pk)
+            if locked.last_notified_message_id is None or message_id > locked.last_notified_message_id:
+                locked.last_notified_message_id = message_id
+                locked.save(update_fields=("last_notified_message_id", "updated_at"))
+        return Response({"last_notified_message_id": locked.last_notified_message_id})
 
 
 class TelegramMessageMediaAPIView(CopyTradingAPIView):

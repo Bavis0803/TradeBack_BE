@@ -169,8 +169,12 @@ async def import_history(strategy, limit=50):
         for item in reversed(messages):
             await _process_item(client, strategy, item, execute=False)
         if messages:
-            strategy.last_message_id = max(item.id for item in messages)
-            await strategy.asave(update_fields=("last_message_id", "updated_at"))
+            latest_message_id = max(item.id for item in messages)
+            strategy.last_message_id = latest_message_id
+            strategy.last_notified_message_id = latest_message_id
+            await strategy.asave(
+                update_fields=("last_message_id", "last_notified_message_id", "updated_at")
+            )
     finally:
         await client.disconnect()
 

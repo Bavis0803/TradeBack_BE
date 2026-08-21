@@ -364,6 +364,59 @@ class CopyTradingAPITests(TestCase):
         )
         self.assertEqual([item["telegram_message_id"] for item in older.data["results"]], list(range(15, 5, -1)))
 
+    def test_notification_cursor_returns_only_messages_missed_while_offline(self):
+        connection = TelegramConnection.objects.create(
+            user=self.user, api_id=654, api_hash="hash", session="session", status="CONNECTED"
+        )
+        strategy = CopyStrategy.objects.create(
+            user=self.user, telegram_connection=connection, chat_id=-1004,
+            chat_title="Notification group", allocation_usdt="10", last_notified_message_id=1,
+        )
+        TelegramMessage.objects.bulk_create([
+            TelegramMessage(
+                strategy=strategy, telegram_message_id=message_id,
+                text=f"Message {message_id}", sent_at=timezone.now() + timedelta(seconds=message_id),
+            )
+            for message_id in range(1, 5)
+        ])
+
+        url = f"/copy-trading/strategies/{strategy.id}/notifications/"
+        pending = self.client.get(url, {"page_size": 2})
+        self.assertEqual(pending.status_code, 200)
+        self.assertEqual(
+            [item["telegram_message_id"] for item in pending.data["results"]], [2, 3]
+        )
+        self.assertTrue(pending.data["has_more"])
+
+        acknowledged = self.client.post(url, {"telegram_message_id": 3}, format="json")
+        self.assertEqual(acknowledged.status_code, 200)
+        self.assertEqual(acknowledged.data["last_notified_message_id"], 3)
+        remaining = self.client.get(url)
+        self.assertEqual(
+            [item["telegram_message_id"] for item in remaining.data["results"]], [4]
+        )
+
+    def test_first_notification_poll_baselines_imported_history(self):
+        connection = TelegramConnection.objects.create(
+            user=self.user, api_id=655, api_hash="hash", session="session", status="CONNECTED"
+        )
+        strategy = CopyStrategy.objects.create(
+            user=self.user, telegram_connection=connection, chat_id=-1005,
+            chat_title="Existing history", allocation_usdt="10",
+        )
+        TelegramMessage.objects.create(
+            strategy=strategy, telegram_message_id=99, text="Imported history",
+            sent_at=timezone.now(),
+        )
+
+        response = self.client.get(
+            f"/copy-trading/strategies/{strategy.id}/notifications/"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["results"], [])
+        strategy.refresh_from_db()
+        self.assertEqual(strategy.last_notified_message_id, 99)
+
     def test_stream_risk_settings_can_be_edited(self):
         connection = TelegramConnection.objects.create(
             user=self.user, api_id=999, api_hash="hash", session="session", status="CONNECTED"

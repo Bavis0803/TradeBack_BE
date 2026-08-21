@@ -3,6 +3,7 @@ from django.urls import path
 from .views import (
     ClosePaperPositionAPIView, CopyPositionsAPIView, PaperReplayAPIView,
     StrategyDetailAPIView, StrategyListCreateAPIView, StrategyMessagesAPIView,
+    StrategyNotificationsAPIView,
     TelegramConnectionAPIView, TelegramMessageMediaAPIView, TelegramStartAPIView,
     TelegramVerifyAPIView,
 )
@@ -16,6 +17,10 @@ urlpatterns = [
     path("positions/<uuid:execution_id>/close/", ClosePaperPositionAPIView.as_view()),
     path("strategies/<uuid:strategy_id>/", StrategyDetailAPIView.as_view()),
     path("strategies/<uuid:strategy_id>/messages/", StrategyMessagesAPIView.as_view()),
+    path(
+        "strategies/<uuid:strategy_id>/notifications/",
+        StrategyNotificationsAPIView.as_view(),
+    ),
     path(
         "strategies/<uuid:strategy_id>/messages/<int:message_id>/media/",
         TelegramMessageMediaAPIView.as_view(),

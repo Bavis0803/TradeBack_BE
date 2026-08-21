@@ -65,6 +65,7 @@ class CopyStrategy(models.Model):
     )
     allowed_symbols = models.JSONField(default=list, blank=True)
     last_message_id = models.BigIntegerField(null=True, blank=True)
+    last_notified_message_id = models.BigIntegerField(null=True, blank=True)
     last_error = models.CharField(max_length=500, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
