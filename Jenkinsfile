@@ -53,7 +53,23 @@ pipeline {
 
     stage('Health check') {
       steps {
-        sh 'port=$(docker compose --env-file .env port frontend 80 | awk -F: "{print \\$NF}"); for i in $(seq 1 20); do curl -fsS http://127.0.0.1:$port/health/ && exit 0; sleep 3; done; exit 1'
+        sh '''
+          port=$(docker compose --env-file .env port frontend 80 | awk -F: '{print $NF}')
+          for i in $(seq 1 20); do
+            if curl -fsS "http://127.0.0.1:$port/health/" >/dev/null; then
+              index_html=$(curl -fsS "http://127.0.0.1:$port/")
+              js_path=$(printf '%s' "$index_html" | grep -oE 'src="[^"]+\.js"' | head -1 | cut -d'"' -f2)
+              css_path=$(printf '%s' "$index_html" | grep -oE 'href="[^"]+\.css"' | head -1 | cut -d'"' -f2)
+              if [ -n "$js_path" ] && [ -n "$css_path" ] \
+                && curl -fsS "http://127.0.0.1:$port$js_path" >/dev/null \
+                && curl -fsS "http://127.0.0.1:$port$css_path" >/dev/null; then
+                exit 0
+              fi
+            fi
+            sleep 3
+          done
+          exit 1
+        '''
       }
     }
   }
