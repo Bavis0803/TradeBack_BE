@@ -98,7 +98,7 @@ class CopyStrategySerializer(serializers.ModelSerializer):
         fields = (
             "id", "chat_id", "chat_title", "chat_username", "mode", "status",
             "allocation_usdt", "max_leverage", "max_daily_loss_usdt", "allowed_symbols",
-            "use_binance_max_leverage",
+            "use_binance_max_leverage", "entry_tolerance_percent",
             "last_message_id", "last_error", "created_at", "updated_at",
         )
         read_only_fields = ("id", "chat_id", "chat_title", "chat_username", "last_message_id", "last_error")
@@ -110,6 +110,9 @@ class CopyStrategyCreateSerializer(serializers.Serializer):
     max_leverage = serializers.IntegerField(min_value=1, max_value=125, default=10)
     use_binance_max_leverage = serializers.BooleanField(default=True)
     max_daily_loss_usdt = serializers.DecimalField(max_digits=20, decimal_places=8, min_value=1, default=50)
+    entry_tolerance_percent = serializers.DecimalField(
+        max_digits=5, decimal_places=3, min_value=0, max_value=2, default=Decimal("0.300")
+    )
     allowed_symbols = serializers.ListField(
         child=serializers.RegexField(r"^[A-Z0-9]{2,20}USDT$"), required=False, default=list
     )
@@ -134,7 +137,8 @@ class CopyStrategyUpdateSerializer(serializers.ModelSerializer):
         model = CopyStrategy
         fields = (
             "mode", "status", "allocation_usdt", "max_leverage", "max_daily_loss_usdt",
-            "allowed_symbols", "use_binance_max_leverage", "confirm_live",
+            "allowed_symbols", "use_binance_max_leverage", "entry_tolerance_percent",
+            "confirm_live",
         )
 
     def validate(self, attrs):

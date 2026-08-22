@@ -202,6 +202,30 @@ class CopyExecutionTests(TestCase):
         self.assertEqual(execution.status, CopyExecution.Status.PAPER_FILLED)
         self.assertEqual(execution.leverage, 20)
 
+    @patch("copytrading.execution._binance_for_user")
+    def test_nearby_price_inside_configured_tolerance_is_filled(self, mock_client):
+        mock_client.return_value = (self.account, FakeBinance(Decimal("523.0")))
+
+        execution = process_telegram_message(
+            self.strategy, 106, CHN_SIGNAL, timezone.now()
+        )[2]
+
+        self.assertEqual(execution.status, CopyExecution.Status.PAPER_FILLED)
+        self.assertEqual(execution.entry_price, Decimal("523.0"))
+
+    @patch("copytrading.execution._binance_for_user")
+    def test_price_outside_configured_tolerance_is_skipped_with_diagnostics(self, mock_client):
+        mock_client.return_value = (self.account, FakeBinance(Decimal("523.1")))
+
+        execution = process_telegram_message(
+            self.strategy, 107, CHN_SIGNAL, timezone.now()
+        )[2]
+
+        self.assertEqual(execution.status, CopyExecution.Status.SKIPPED)
+        self.assertIn("Current Binance price 523.1", execution.error)
+        self.assertIn("0.3% tolerance", execution.error)
+        self.assertIn("accepted 519.9355-523.0645", execution.error)
+
     def test_history_import_parses_but_never_executes_old_signal(self):
         message, signal, execution = process_telegram_message(
             self.strategy, 99, CHN_SIGNAL, timezone.now() - timedelta(days=1), execute=False
@@ -428,11 +452,16 @@ class CopyTradingAPITests(TestCase):
         )
         response = self.client.patch(
             f"/copy-trading/strategies/{strategy.id}/",
-            {"allocation_usdt": "25", "max_leverage": 7, "max_daily_loss_usdt": "80", "status": "PAUSED"},
+            {
+                "allocation_usdt": "25", "max_leverage": 7,
+                "max_daily_loss_usdt": "80", "entry_tolerance_percent": "0.450",
+                "status": "PAUSED",
+            },
             format="json",
         )
         self.assertEqual(response.status_code, 200)
         strategy.refresh_from_db()
         self.assertEqual(strategy.allocation_usdt, Decimal("25"))
         self.assertEqual(strategy.max_leverage, 7)
+        self.assertEqual(strategy.entry_tolerance_percent, Decimal("0.450"))
         self.assertEqual(strategy.status, CopyStrategy.Status.PAUSED)

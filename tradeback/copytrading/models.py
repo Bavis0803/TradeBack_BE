@@ -1,4 +1,5 @@
 import uuid
+from decimal import Decimal
 
 from django.conf import settings
 from django.core.validators import MinValueValidator, MaxValueValidator
@@ -62,6 +63,12 @@ class CopyStrategy(models.Model):
     use_binance_max_leverage = models.BooleanField(default=True)
     max_daily_loss_usdt = models.DecimalField(
         max_digits=20, decimal_places=8, default=50, validators=[MinValueValidator(1)]
+    )
+    entry_tolerance_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=3,
+        default=Decimal("0.300"),
+        validators=[MinValueValidator(0), MaxValueValidator(2)],
     )
     allowed_symbols = models.JSONField(default=list, blank=True)
     last_message_id = models.BigIntegerField(null=True, blank=True)

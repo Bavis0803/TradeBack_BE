@@ -31,6 +31,14 @@ def _floor_step(value, step):
     return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
+def _accepted_entry_range(strategy, signal):
+    tolerance = Decimal(str(strategy.entry_tolerance_percent)) / Decimal("100")
+    return (
+        signal.entry_low * (Decimal("1") - tolerance),
+        signal.entry_high * (Decimal("1") + tolerance),
+    )
+
+
 def _skip(strategy, signal, entry, message):
     return CopyExecution.objects.create(
         strategy=strategy,
@@ -199,9 +207,32 @@ def execute_signal(strategy, signal, paper_replay=False):
 
     market_price = context["current_price"]
     price = signal.entry_low if paper_replay and strategy.mode == CopyStrategy.Mode.PAPER else market_price
-    # Never chase a signal after price has left its stated entry range.
-    if not paper_replay and not signal.entry_low <= price <= signal.entry_high:
-        return _skip(strategy, signal, price, "Current price is outside the signal entry range.")
+    accepted_low, accepted_high = _accepted_entry_range(strategy, signal)
+    if not paper_replay and not accepted_low <= price <= accepted_high:
+        return _skip(
+            strategy,
+            signal,
+            price,
+            (
+                f"Current Binance price {decimal_to_string(price)} is outside entry "
+                f"{decimal_to_string(signal.entry_low)}-{decimal_to_string(signal.entry_high)} "
+                f"with {decimal_to_string(strategy.entry_tolerance_percent)}% tolerance "
+                f"(accepted {decimal_to_string(accepted_low)}-{decimal_to_string(accepted_high)})."
+            ),
+        )
+    first_target = Decimal(str(signal.take_profits[0]))
+    risk_structure_valid = (
+        signal.stop_loss < price < first_target
+        if signal.direction == "LONG"
+        else first_target < price < signal.stop_loss
+    )
+    if not paper_replay and not risk_structure_valid:
+        return _skip(
+            strategy,
+            signal,
+            price,
+            "Current price has crossed the signal stop-loss or first target.",
+        )
     if allocation > balance:
         return _skip(strategy, signal, price, "Per-order allocation exceeds available Futures balance.")
     if allocation > Decimal(str(settings.COPY_TRADING_MAX_ALLOCATION_USDT)):
