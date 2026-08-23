@@ -116,7 +116,7 @@ class CopyStrategyCreateSerializer(serializers.Serializer):
         max_digits=5, decimal_places=3, min_value=0, max_value=2, default=Decimal("0.300")
     )
     entry_order_type = serializers.ChoiceField(
-        choices=CopyStrategy.EntryOrderType.choices, default=CopyStrategy.EntryOrderType.LIMIT
+        choices=CopyStrategy.EntryOrderType.choices, default=CopyStrategy.EntryOrderType.SMART
     )
     limit_expiry_minutes = serializers.IntegerField(min_value=11, max_value=120, default=15)
     allowed_symbols = serializers.ListField(

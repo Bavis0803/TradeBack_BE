@@ -45,6 +45,22 @@ def _accepted_entry_range(strategy, signal):
     )
 
 
+def _resolve_entry_order_type(strategy, signal, price, accepted_low, accepted_high, paper_replay):
+    if paper_replay:
+        return CopyStrategy.EntryOrderType.MARKET
+    if strategy.entry_order_type != CopyStrategy.EntryOrderType.SMART:
+        return strategy.entry_order_type
+    slipped_against_trade = (
+        signal.direction == "LONG" and price > accepted_high
+    ) or (
+        signal.direction == "SHORT" and price < accepted_low
+    )
+    return (
+        CopyStrategy.EntryOrderType.LIMIT
+        if slipped_against_trade else CopyStrategy.EntryOrderType.MARKET
+    )
+
+
 def _skip(strategy, signal, entry, message):
     return CopyExecution.objects.create(
         strategy=strategy,
@@ -253,9 +269,8 @@ def execute_signal(strategy, signal, paper_replay=False):
     strategy_cap = binance_symbol_max if strategy.use_binance_max_leverage else strategy.max_leverage
     requested = signal.requested_leverage or strategy_cap
     leverage = min(requested, strategy_cap, 125)
-    order_type = (
-        CopyStrategy.EntryOrderType.MARKET
-        if paper_replay else strategy.entry_order_type
+    order_type = _resolve_entry_order_type(
+        strategy, signal, price, accepted_low, accepted_high, paper_replay
     )
     order_price = price if order_type == CopyStrategy.EntryOrderType.MARKET else _limit_price(signal, context)
     tentative_notional = allocation * leverage

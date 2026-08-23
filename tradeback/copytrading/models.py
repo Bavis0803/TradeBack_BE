@@ -45,6 +45,7 @@ class CopyStrategy(models.Model):
     class EntryOrderType(models.TextChoices):
         MARKET = "MARKET", "Market entry"
         LIMIT = "LIMIT", "Limit entry"
+        SMART = "SMART", "Market with limit fallback"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(
@@ -75,7 +76,7 @@ class CopyStrategy(models.Model):
         validators=[MinValueValidator(0), MaxValueValidator(2)],
     )
     entry_order_type = models.CharField(
-        max_length=8, choices=EntryOrderType.choices, default=EntryOrderType.MARKET
+        max_length=8, choices=EntryOrderType.choices, default=EntryOrderType.SMART
     )
     limit_expiry_minutes = models.PositiveSmallIntegerField(
         default=15, validators=[MinValueValidator(11), MaxValueValidator(120)]

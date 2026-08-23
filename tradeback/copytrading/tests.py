@@ -243,6 +243,8 @@ class CopyExecutionTests(TestCase):
     @patch("copytrading.execution._binance_for_user")
     def test_price_outside_configured_tolerance_is_skipped_with_diagnostics(self, mock_client):
         mock_client.return_value = (self.account, FakeBinance(Decimal("523.1")))
+        self.strategy.entry_order_type = CopyStrategy.EntryOrderType.MARKET
+        self.strategy.save(update_fields=("entry_order_type",))
 
         execution = process_telegram_message(
             self.strategy, 107, CHN_SIGNAL, timezone.now()
@@ -252,6 +254,30 @@ class CopyExecutionTests(TestCase):
         self.assertIn("Current Binance price 523.1", execution.error)
         self.assertIn("0.3% tolerance", execution.error)
         self.assertIn("accepted 519.9355-523.0645", execution.error)
+
+    @patch("copytrading.execution._binance_for_user")
+    def test_smart_entry_falls_back_to_limit_after_adverse_slippage(self, mock_client):
+        mock_client.return_value = (self.account, FakeBinance(Decimal("523.1")))
+
+        execution = process_telegram_message(
+            self.strategy, 112, CHN_SIGNAL, timezone.now()
+        )[2]
+
+        self.assertEqual(execution.status, CopyExecution.Status.PENDING_ENTRY)
+        self.assertEqual(execution.entry_order_type, CopyStrategy.EntryOrderType.LIMIT)
+        self.assertEqual(execution.limit_price, Decimal("521.5"))
+
+    @patch("copytrading.execution._binance_for_user")
+    def test_smart_entry_uses_market_for_a_favorable_price(self, mock_client):
+        mock_client.return_value = (self.account, FakeBinance(Decimal("519")))
+
+        execution = process_telegram_message(
+            self.strategy, 113, CHN_SIGNAL, timezone.now()
+        )[2]
+
+        self.assertEqual(execution.status, CopyExecution.Status.PAPER_FILLED)
+        self.assertEqual(execution.entry_order_type, CopyStrategy.EntryOrderType.MARKET)
+        self.assertEqual(execution.entry_price, Decimal("519"))
 
     @patch("copytrading.positions.BinanceService.get_futures_mark_prices")
     @patch("copytrading.execution._binance_for_user")
