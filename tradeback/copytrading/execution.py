@@ -10,6 +10,7 @@ from exchanges.models import ExchangeAccount, TradeLog
 from exchanges.services import BinanceService, BinanceServiceError, decimal_to_string, get_bracket_for_notional
 
 from .models import CopyExecution, CopyStrategy, TelegramMessage, TradeSignal
+from .ai_detection import analyze_signal_candidate
 from .parser import SignalParseError, parse_signal, signal_symbol_hint
 
 
@@ -75,7 +76,6 @@ def _skip(strategy, signal, entry, message):
     )
 
 
-@transaction.atomic
 def process_telegram_message(
     strategy, telegram_message_id, text, sent_at, sender_name="", execute=True
 ):
@@ -126,6 +126,7 @@ def _multipart_signal(strategy, message):
 def _process_saved_message(strategy, message, execute):
     direct_parse_failed = False
     multipart = False
+    ai_parsed = False
 
     try:
         parsed = parse_signal(message.text)
@@ -135,6 +136,9 @@ def _process_saved_message(strategy, message, execute):
     if parsed is None:
         parsed = _multipart_signal(strategy, message)
         multipart = parsed is not None
+    if parsed is None and execute:
+        parsed = analyze_signal_candidate(strategy, message.text)
+        ai_parsed = parsed is not None
     if parsed is None:
         if direct_parse_failed:
             message.parse_status = TelegramMessage.ParseStatus.INVALID
@@ -152,7 +156,7 @@ def _process_saved_message(strategy, message, execute):
         stop_loss=parsed.stop_loss,
         take_profits=[decimal_to_string(value) for value in parsed.take_profits],
         requested_leverage=parsed.leverage,
-        parser_version="chn-v2-multi" if multipart else "chn-v2",
+        parser_version=("ai-signal-v1" if ai_parsed else "chn-v2-multi" if multipart else "chn-v2"),
     )
     execution = execute_signal(strategy, signal) if execute else None
     return message, signal, execution

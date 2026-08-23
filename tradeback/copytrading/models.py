@@ -32,6 +32,37 @@ class TelegramConnection(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
 
+class AISignalAgent(models.Model):
+    class Provider(models.TextChoices):
+        OPENAI = "OPENAI", "OpenAI"
+
+    class Status(models.TextChoices):
+        CONNECTED = "CONNECTED", "Connected"
+        ERROR = "ERROR", "Error"
+        DISABLED = "DISABLED", "Disabled"
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="ai_signal_agent"
+    )
+    provider = models.CharField(max_length=16, choices=Provider.choices, default=Provider.OPENAI)
+    api_key = EncryptedTextField()
+    api_key_hint = models.CharField(max_length=16, blank=True)
+    model = models.CharField(max_length=64, default="gpt-5-nano")
+    enabled = models.BooleanField(default=True)
+    min_confidence = models.DecimalField(
+        max_digits=4, decimal_places=3, default=Decimal("0.900"),
+        validators=[MinValueValidator(Decimal("0.500")), MaxValueValidator(Decimal("1.000"))],
+    )
+    daily_call_limit = models.PositiveSmallIntegerField(
+        default=50, validators=[MinValueValidator(1), MaxValueValidator(1000)]
+    )
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.CONNECTED)
+    last_error = models.CharField(max_length=500, blank=True)
+    last_verified_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
 class CopyStrategy(models.Model):
     class Mode(models.TextChoices):
         PAPER = "PAPER", "Paper trading"
@@ -81,6 +112,7 @@ class CopyStrategy(models.Model):
     limit_expiry_minutes = models.PositiveSmallIntegerField(
         default=15, validators=[MinValueValidator(11), MaxValueValidator(120)]
     )
+    ai_detection_enabled = models.BooleanField(default=False)
     allowed_symbols = models.JSONField(default=list, blank=True)
     last_message_id = models.BigIntegerField(null=True, blank=True)
     last_notified_message_id = models.BigIntegerField(null=True, blank=True)
@@ -145,6 +177,40 @@ class TradeSignal(models.Model):
     requested_leverage = models.PositiveSmallIntegerField(null=True, blank=True)
     parser_version = models.CharField(max_length=16, default="chn-v1")
     created_at = models.DateTimeField(auto_now_add=True)
+
+
+class AISignalAnalysis(models.Model):
+    class Status(models.TextChoices):
+        SIGNAL = "SIGNAL", "Signal"
+        NOT_SIGNAL = "NOT_SIGNAL", "Not a signal"
+        LOW_CONFIDENCE = "LOW_CONFIDENCE", "Low confidence"
+        ERROR = "ERROR", "Error"
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="ai_signal_analyses"
+    )
+    content_hash = models.CharField(max_length=64)
+    provider = models.CharField(max_length=16)
+    model = models.CharField(max_length=64)
+    prompt_version = models.CharField(max_length=16)
+    status = models.CharField(max_length=16, choices=Status.choices)
+    confidence = models.DecimalField(max_digits=4, decimal_places=3, default=0)
+    result = models.JSONField(default=dict)
+    input_tokens = models.PositiveIntegerField(default=0)
+    output_tokens = models.PositiveIntegerField(default=0)
+    error = models.CharField(max_length=500, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=("user", "content_hash", "provider", "model", "prompt_version"),
+                name="unique_ai_signal_analysis",
+            )
+        ]
+        indexes = [
+            models.Index(fields=("user", "-created_at"), name="ai_signal_user_time_idx"),
+        ]
 
 
 class CopyExecution(models.Model):

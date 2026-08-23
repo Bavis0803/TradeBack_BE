@@ -12,7 +12,11 @@ from rest_framework.test import APIClient
 from exchanges.models import ExchangeAccount, ExchangeCredential, TradeLog
 
 from .execution import process_telegram_message, reprocess_saved_message
-from .models import CopyExecution, CopyStrategy, TelegramConnection, TelegramMessage
+from .ai_detection import is_ai_candidate
+from .models import (
+    AISignalAgent, AISignalAnalysis, CopyExecution, CopyStrategy,
+    TelegramConnection, TelegramMessage,
+)
 from .parser import SignalParseError, parse_signal
 from .telegram import chat_reference_candidates, get_strategy_telegram_connection
 from .positions import get_position_payload, reconcile_pending_entries
@@ -45,6 +49,11 @@ class SignalParserTests(SimpleTestCase):
         self.assertIsNone(parse_signal("#PENGU LONG 0.00625 +6.6% All target done"))
         with self.assertRaises(SignalParseError):
             parse_signal("#ZEC LONG Entry: 521.5")
+
+    def test_ai_prefilter_rejects_chat_and_result_updates(self):
+        self.assertFalse(is_ai_candidate("Good morning everyone"))
+        self.assertFalse(is_ai_candidate("#ZEC LONG TP hit profit 20%"))
+        self.assertTrue(is_ai_candidate("#ZECUSDT BUY | Buy zone 521.5 | TP1 540 | Stop 497"))
 
 
 class TelegramChatReferenceTests(SimpleTestCase):
@@ -279,6 +288,36 @@ class CopyExecutionTests(TestCase):
         self.assertEqual(execution.entry_order_type, CopyStrategy.EntryOrderType.MARKET)
         self.assertEqual(execution.entry_price, Decimal("519"))
 
+    @patch("copytrading.ai_detection._openai_response")
+    @patch("copytrading.execution._binance_for_user")
+    def test_ai_fallback_parses_only_candidate_and_reuses_cached_result(self, mock_binance, mock_ai):
+        mock_binance.return_value = (self.account, FakeBinance())
+        AISignalAgent.objects.create(
+            user=self.user, api_key="sk-test-secret-key-value", model="gpt-5-nano",
+            status=AISignalAgent.Status.CONNECTED,
+        )
+        self.strategy.ai_detection_enabled = True
+        self.strategy.save(update_fields=("ai_detection_enabled",))
+        text = "#ZECUSDT BUY | Buy zone 521.5 | TP1 540.1 | Stop 497 | 20x"
+        result = {
+            "is_signal": True, "confidence": 0.97, "symbol": "ZECUSDT",
+            "direction": "LONG", "entry_low": "521.5", "entry_high": "521.5",
+            "stop_loss": "497", "take_profits": ["540.1"], "leverage": 20,
+            "reason_code": "ACTIONABLE",
+        }
+        mock_ai.return_value = (result, 90, 45)
+
+        first = process_telegram_message(self.strategy, 114, text, timezone.now())
+        second = process_telegram_message(self.strategy, 115, text, timezone.now())
+
+        self.assertEqual(first[1].parser_version, "ai-signal-v1")
+        self.assertEqual(first[2].status, CopyExecution.Status.PAPER_FILLED)
+        self.assertEqual(second[1].parser_version, "ai-signal-v1")
+        self.assertEqual(mock_ai.call_count, 1)
+        analysis = AISignalAnalysis.objects.get()
+        self.assertEqual(analysis.status, AISignalAnalysis.Status.SIGNAL)
+        self.assertEqual(analysis.input_tokens, 90)
+
     @patch("copytrading.positions.BinanceService.get_futures_mark_prices")
     @patch("copytrading.execution._binance_for_user")
     def test_paper_limit_waits_for_retrace_then_opens(self, mock_client, mock_marks):
@@ -450,6 +489,45 @@ class CopyTradingAPITests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.data["live_enabled"])
+
+    @patch("copytrading.views.verify_agent")
+    def test_ai_agent_key_is_verified_but_never_returned(self, mock_verify):
+        secret = "sk-super-secret-openai-key-value"
+        response = self.client.post(
+            "/copy-trading/ai-agent/",
+            {
+                "api_key": secret, "model": "gpt-5-nano",
+                "min_confidence": "0.920", "daily_call_limit": 25,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(secret, str(response.data))
+        self.assertEqual(response.data["api_key_hint"], "***alue")
+        self.assertEqual(response.data["daily_call_limit"], 25)
+        self.assertEqual(self.client.get("/copy-trading/ai-agent/").status_code, 200)
+        mock_verify.assert_called_once()
+
+    def test_enabling_ai_on_live_stream_requires_explicit_confirmation(self):
+        connection = TelegramConnection.objects.create(
+            user=self.user, api_id=123, api_hash="hash", session="session", status="CONNECTED"
+        )
+        strategy = CopyStrategy.objects.create(
+            user=self.user, telegram_connection=connection, chat_id=-100777,
+            chat_title="Live AI", allocation_usdt="10", mode=CopyStrategy.Mode.LIVE,
+        )
+        response = self.client.patch(
+            f"/copy-trading/strategies/{strategy.id}/",
+            {"ai_detection_enabled": True}, format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("AI-detected LIVE orders", str(response.data))
+
+        response = self.client.patch(
+            f"/copy-trading/strategies/{strategy.id}/",
+            {"ai_detection_enabled": True, "confirm_ai_live": True}, format="json",
+        )
+        self.assertEqual(response.status_code, 200)
 
     def test_live_creation_requires_explicit_confirmation(self):
         response = self.client.post(

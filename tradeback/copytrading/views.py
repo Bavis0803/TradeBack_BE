@@ -4,17 +4,20 @@ from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.http import FileResponse, Http404
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .execution import execute_signal
-from .models import CopyExecution, CopyStrategy, TelegramConnection, TelegramMessage
+from .ai_detection import AISignalError, verify_agent
+from .models import AISignalAgent, CopyExecution, CopyStrategy, TelegramConnection, TelegramMessage
 from .positions import cancel_pending_entry, close_paper_position, get_position_payload
 from .serializers import (
     CopyStrategyCreateSerializer, CopyStrategySerializer, CopyStrategyUpdateSerializer,
-    CopyExecutionSerializer, TelegramConnectionSerializer, TelegramMessageSerializer, TelegramStartSerializer,
+    AISignalAgentConnectSerializer, AISignalAgentSerializer, CopyExecutionSerializer,
+    TelegramConnectionSerializer, TelegramMessageSerializer, TelegramStartSerializer,
     TelegramVerifySerializer,
 )
 from .telegram import begin_login, import_history, resolve_chat, verify_login
@@ -39,6 +42,52 @@ class TelegramConnectionAPIView(CopyTradingAPIView):
 
     def delete(self, request):
         TelegramConnection.objects.filter(user=request.user).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class AISignalAgentAPIView(CopyTradingAPIView):
+    throttle_scope = "copy_trading"
+
+    def get(self, request):
+        agent = AISignalAgent.objects.filter(user=request.user).first()
+        return Response(AISignalAgentSerializer(agent).data if agent else None)
+
+    def post(self, request):
+        serializer = AISignalAgentConnectSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        values = serializer.validated_data
+        api_key = values.pop("api_key")
+        agent, _ = AISignalAgent.objects.update_or_create(
+            user=request.user,
+            defaults={
+                **values, "provider": AISignalAgent.Provider.OPENAI,
+                "api_key": api_key, "api_key_hint": f"***{api_key[-4:]}",
+                "enabled": True, "status": AISignalAgent.Status.CONNECTED, "last_error": "",
+            },
+        )
+        try:
+            verify_agent(agent)
+        except AISignalError as exc:
+            agent.status = AISignalAgent.Status.ERROR
+            agent.last_error = str(exc)[:500]
+            agent.save(update_fields=("status", "last_error", "updated_at"))
+            return Response(
+                {"detail": str(exc), "agent": AISignalAgentSerializer(agent).data}, status=400
+            )
+        agent.last_verified_at = timezone.now()
+        agent.save(update_fields=("last_verified_at", "updated_at"))
+        return Response(AISignalAgentSerializer(agent).data)
+
+    def patch(self, request):
+        agent = get_object_or_404(AISignalAgent, user=request.user)
+        serializer = AISignalAgentSerializer(agent, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(AISignalAgentSerializer(agent).data)
+
+    def delete(self, request):
+        AISignalAgent.objects.filter(user=request.user).delete()
+        CopyStrategy.objects.filter(user=request.user).update(ai_detection_enabled=False)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -93,6 +142,7 @@ class StrategyListCreateAPIView(CopyTradingAPIView):
         try:
             chat = async_to_sync(resolve_chat)(connection, values.pop("chat_reference"))
             values.pop("confirm_live", None)
+            values.pop("confirm_ai_live", None)
             strategy = CopyStrategy.objects.create(
                 user=request.user, telegram_connection=connection, **chat, **values
             )
@@ -114,6 +164,7 @@ class StrategyDetailAPIView(CopyTradingAPIView):
         serializer = CopyStrategyUpdateSerializer(strategy, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.validated_data.pop("confirm_live", None)
+        serializer.validated_data.pop("confirm_ai_live", None)
         serializer.save()
         return Response(CopyStrategySerializer(strategy).data)
 

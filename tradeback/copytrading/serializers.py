@@ -2,9 +2,47 @@ from decimal import Decimal
 import re
 
 from django.conf import settings
+from django.db.models import Count, Sum
+from django.utils import timezone
 from rest_framework import serializers
 
-from .models import CopyExecution, CopyStrategy, TelegramConnection, TelegramMessage, TradeSignal
+from .models import AISignalAgent, CopyExecution, CopyStrategy, TelegramConnection, TelegramMessage, TradeSignal
+
+
+class AISignalAgentSerializer(serializers.ModelSerializer):
+    usage_today = serializers.SerializerMethodField()
+
+    def get_usage_today(self, obj):
+        usage = obj.user.ai_signal_analyses.filter(
+            created_at__date=timezone.localdate()
+        ).aggregate(calls=Count("id"), input_tokens=Sum("input_tokens"), output_tokens=Sum("output_tokens"))
+        return {
+            "calls": usage["calls"] or 0,
+            "input_tokens": usage["input_tokens"] or 0,
+            "output_tokens": usage["output_tokens"] or 0,
+        }
+
+    class Meta:
+        model = AISignalAgent
+        fields = (
+            "provider", "api_key_hint", "model", "enabled", "min_confidence",
+            "daily_call_limit", "status", "last_error", "last_verified_at", "updated_at",
+            "usage_today",
+        )
+        read_only_fields = (
+            "api_key_hint", "status", "last_error", "last_verified_at", "updated_at",
+            "usage_today",
+        )
+
+
+class AISignalAgentConnectSerializer(serializers.Serializer):
+    api_key = serializers.CharField(min_length=20, max_length=512, write_only=True)
+    model = serializers.RegexField(r"^[A-Za-z0-9._:-]{2,64}$", default="gpt-5-nano")
+    min_confidence = serializers.DecimalField(
+        max_digits=4, decimal_places=3, min_value=Decimal("0.500"),
+        max_value=Decimal("1.000"), default=Decimal("0.900"),
+    )
+    daily_call_limit = serializers.IntegerField(min_value=1, max_value=1000, default=50)
 
 
 class TelegramConnectionSerializer(serializers.ModelSerializer):
@@ -51,7 +89,7 @@ class TradeSignalSerializer(serializers.ModelSerializer):
         model = TradeSignal
         fields = (
             "symbol", "direction", "entry_low", "entry_high", "stop_loss",
-            "take_profits", "requested_leverage",
+            "take_profits", "requested_leverage", "parser_version",
         )
 
 
@@ -101,6 +139,7 @@ class CopyStrategySerializer(serializers.ModelSerializer):
             "allocation_usdt", "max_leverage", "max_daily_loss_usdt", "allowed_symbols",
             "use_binance_max_leverage", "entry_tolerance_percent",
             "entry_order_type", "limit_expiry_minutes",
+            "ai_detection_enabled",
             "last_message_id", "last_error", "created_at", "updated_at",
         )
         read_only_fields = ("id", "chat_id", "chat_title", "chat_username", "last_message_id", "last_error")
@@ -119,11 +158,13 @@ class CopyStrategyCreateSerializer(serializers.Serializer):
         choices=CopyStrategy.EntryOrderType.choices, default=CopyStrategy.EntryOrderType.SMART
     )
     limit_expiry_minutes = serializers.IntegerField(min_value=11, max_value=120, default=15)
+    ai_detection_enabled = serializers.BooleanField(default=False)
     allowed_symbols = serializers.ListField(
         child=serializers.RegexField(r"^[A-Z0-9]{2,20}USDT$"), required=False, default=list
     )
     mode = serializers.ChoiceField(choices=CopyStrategy.Mode.choices, default=CopyStrategy.Mode.PAPER)
     confirm_live = serializers.BooleanField(default=False, write_only=True)
+    confirm_ai_live = serializers.BooleanField(default=False, write_only=True)
 
     def validate(self, attrs):
         if attrs["allocation_usdt"] > Decimal(str(settings.COPY_TRADING_MAX_ALLOCATION_USDT)):
@@ -133,11 +174,16 @@ class CopyStrategyCreateSerializer(serializers.Serializer):
                 raise serializers.ValidationError({"confirm_live": "Explicit confirmation is required for LIVE mode."})
             if not settings.COPY_TRADING_LIVE_ENABLED:
                 raise serializers.ValidationError({"mode": "Live copy trading is disabled by the server."})
+            if attrs.get("ai_detection_enabled") and not attrs.get("confirm_ai_live"):
+                raise serializers.ValidationError({
+                    "confirm_ai_live": "Explicit confirmation is required for AI-detected LIVE orders."
+                })
         return attrs
 
 
 class CopyStrategyUpdateSerializer(serializers.ModelSerializer):
     confirm_live = serializers.BooleanField(default=False, write_only=True)
+    confirm_ai_live = serializers.BooleanField(default=False, write_only=True)
 
     class Meta:
         model = CopyStrategy
@@ -145,7 +191,9 @@ class CopyStrategyUpdateSerializer(serializers.ModelSerializer):
             "mode", "status", "allocation_usdt", "max_leverage", "max_daily_loss_usdt",
             "allowed_symbols", "use_binance_max_leverage", "entry_tolerance_percent",
             "entry_order_type", "limit_expiry_minutes",
+            "ai_detection_enabled",
             "confirm_live",
+            "confirm_ai_live",
         )
 
     def validate(self, attrs):
@@ -169,4 +217,13 @@ class CopyStrategyUpdateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({"confirm_live": "Explicit confirmation is required for LIVE mode."})
             if not settings.COPY_TRADING_LIVE_ENABLED:
                 raise serializers.ValidationError({"mode": "Live copy trading is disabled by the server."})
+        ai_enabled = attrs.get("ai_detection_enabled", self.instance.ai_detection_enabled)
+        if (
+            mode == CopyStrategy.Mode.LIVE and ai_enabled
+            and not self.instance.ai_detection_enabled
+            and not attrs.get("confirm_ai_live")
+        ):
+            raise serializers.ValidationError({
+                "confirm_ai_live": "Explicit confirmation is required for AI-detected LIVE orders."
+            })
         return attrs

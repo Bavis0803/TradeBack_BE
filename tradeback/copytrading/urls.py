@@ -1,7 +1,8 @@
 from django.urls import path
 
 from .views import (
-    CancelPendingEntryAPIView, ClosePaperPositionAPIView, CopyPositionsAPIView, PaperReplayAPIView,
+    AISignalAgentAPIView, CancelPendingEntryAPIView, ClosePaperPositionAPIView,
+    CopyPositionsAPIView, PaperReplayAPIView,
     StrategyDetailAPIView, StrategyListCreateAPIView, StrategyMessagesAPIView,
     StrategyNotificationsAPIView,
     TelegramConnectionAPIView, TelegramMessageMediaAPIView, TelegramStartAPIView,
@@ -9,6 +10,7 @@ from .views import (
 )
 
 urlpatterns = [
+    path("ai-agent/", AISignalAgentAPIView.as_view()),
     path("telegram/", TelegramConnectionAPIView.as_view()),
     path("telegram/start/", TelegramStartAPIView.as_view()),
     path("telegram/verify/", TelegramVerifyAPIView.as_view()),
