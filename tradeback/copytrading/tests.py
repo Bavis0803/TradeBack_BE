@@ -15,9 +15,9 @@ from .execution import process_telegram_message, reprocess_saved_message
 from .ai_detection import is_ai_candidate
 from .models import (
     AISignalAgent, AISignalAnalysis, CopyExecution, CopyStrategy,
-    TelegramConnection, TelegramMessage,
+    SignalCandidate, TelegramConnection, TelegramMessage,
 )
-from .parser import SignalParseError, parse_signal
+from .parser import SignalParseError, parse_signal, parse_signal_candidate
 from .telegram import chat_reference_candidates, get_strategy_telegram_connection
 from .positions import get_position_payload, reconcile_pending_entries
 
@@ -35,6 +35,12 @@ CHIP_SIGNAL_DETAILS = """#FUTURE #CHIP
 Entry: 0.0271
 Target: 0.0285 - 0.0309
 SL: 0.0252 ( 7 % )"""
+
+RAVE_SIGNAL_HEADER = "#RAVE #SHORT 0.2882"
+RAVE_SIGNAL_DETAILS = """#FUTURE #RAVE LONG
+Entry: 0.2882
+Target: 0.2682 - 0.2476
+SL: 0.3084 (7%)"""
 
 
 class SignalParserTests(SimpleTestCase):
@@ -54,6 +60,15 @@ class SignalParserTests(SimpleTestCase):
         self.assertFalse(is_ai_candidate("Good morning everyone"))
         self.assertFalse(is_ai_candidate("#ZEC LONG TP hit profit 20%"))
         self.assertTrue(is_ai_candidate("#ZECUSDT BUY | Buy zone 521.5 | TP1 540 | Stop 497"))
+
+    def test_detects_explicit_early_signal_but_not_result_commentary(self):
+        candidate = parse_signal_candidate(
+            "#SUI has a LONG Signal - CHN Supertrend H1 Possible Target 0.86"
+        )
+        self.assertEqual(candidate.symbol, "SUIUSDT")
+        self.assertEqual(candidate.direction, "LONG")
+        self.assertEqual(candidate.target_hint, "0.86")
+        self.assertIsNone(parse_signal_candidate("#CHIP is flying after a BUY Signal"))
 
 
 class TelegramChatReferenceTests(SimpleTestCase):
@@ -183,6 +198,110 @@ class CopyExecutionTests(TestCase):
         self.assertEqual(CopyExecution.objects.filter(strategy=self.strategy).count(), 1)
         self.assertEqual(TradeLog.objects.filter(source=TradeLog.Source.DRAFT).count(), 1)
         self.assertIsNone(duplicate[2])
+
+    @patch("copytrading.execution._binance_for_user")
+    def test_split_signal_uses_prior_direction_when_detail_has_typo(self, mock_client):
+        mock_client.return_value = (self.account, FakeBinance(Decimal("0.2882")))
+        sent = timezone.now()
+        process_telegram_message(self.strategy, 211, RAVE_SIGNAL_HEADER, sent)
+        _, signal, execution = process_telegram_message(
+            self.strategy, 212, RAVE_SIGNAL_DETAILS, sent + timedelta(minutes=2)
+        )
+
+        self.assertEqual(signal.symbol, "RAVEUSDT")
+        self.assertEqual(signal.direction, "SHORT")
+        self.assertEqual(signal.parser_version, "chn-v2-multi")
+        self.assertEqual(execution.status, CopyExecution.Status.PAPER_FILLED)
+
+    def test_early_signal_creates_review_candidate_without_order(self):
+        message, signal, execution = process_telegram_message(
+            self.strategy,
+            220,
+            "#SUI has a LONG Signal - CHN Supertrend H1 Possible Target 0.86",
+            timezone.now(),
+        )
+
+        self.assertIsNone(signal)
+        self.assertIsNone(execution)
+        self.assertEqual(message.parse_status, TelegramMessage.ParseStatus.REVIEW)
+        self.assertEqual(message.signal_candidate.status, SignalCandidate.Status.PENDING)
+        self.assertEqual(CopyExecution.objects.count(), 0)
+
+    @patch("copytrading.views.execute_signal")
+    def test_user_can_approve_review_candidate_with_complete_risk_levels(self, mock_execute):
+        message, _, _ = process_telegram_message(
+            self.strategy,
+            221,
+            "#SUI has a LONG Signal - CHN Supertrend H1 Possible Target 0.86",
+            timezone.now(),
+        )
+        api = APIClient()
+        api.force_authenticate(self.user)
+        response = api.post(
+            f"/copy-trading/strategies/{self.strategy.id}/messages/221/review/",
+            {
+                "action": "APPROVE",
+                "entry_price": "0.81",
+                "stop_loss": "0.77",
+                "take_profit": "0.86",
+                "leverage": 5,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        message.refresh_from_db()
+        self.assertEqual(message.signal.direction, "LONG")
+        self.assertEqual(message.signal.parser_version, "user-review-v1")
+        self.assertEqual(message.signal_candidate.status, SignalCandidate.Status.APPROVED)
+        mock_execute.assert_called_once()
+
+    def test_review_rejects_invalid_price_structure(self):
+        process_telegram_message(
+            self.strategy,
+            222,
+            "#SUI has a LONG Signal - CHN Supertrend H1 Possible Target 0.86",
+            timezone.now(),
+        )
+        api = APIClient()
+        api.force_authenticate(self.user)
+        response = api.post(
+            f"/copy-trading/strategies/{self.strategy.id}/messages/222/review/",
+            {
+                "action": "APPROVE",
+                "entry_price": "0.81",
+                "stop_loss": "0.84",
+                "take_profit": "0.86",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(CopyExecution.objects.count(), 0)
+
+    def test_live_review_requires_explicit_real_order_confirmation(self):
+        self.strategy.mode = CopyStrategy.Mode.LIVE
+        self.strategy.save(update_fields=("mode",))
+        process_telegram_message(
+            self.strategy,
+            223,
+            "#SUI has a LONG Signal - CHN Supertrend H1 Possible Target 0.86",
+            timezone.now(),
+        )
+        api = APIClient()
+        api.force_authenticate(self.user)
+        response = api.post(
+            f"/copy-trading/strategies/{self.strategy.id}/messages/223/review/",
+            {
+                "action": "APPROVE",
+                "entry_price": "0.81",
+                "stop_loss": "0.77",
+                "take_profit": "0.86",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("confirm_live", response.data)
+        self.assertEqual(CopyExecution.objects.count(), 0)
 
     def test_split_signal_does_not_merge_different_symbols_or_stale_posts(self):
         sent = timezone.now()

@@ -6,7 +6,10 @@ from django.db.models import Count, Sum
 from django.utils import timezone
 from rest_framework import serializers
 
-from .models import AISignalAgent, CopyExecution, CopyStrategy, TelegramConnection, TelegramMessage, TradeSignal
+from .models import (
+    AISignalAgent, CopyExecution, CopyStrategy, SignalCandidate, TelegramConnection,
+    TelegramMessage, TradeSignal,
+)
 
 
 class AISignalAgentSerializer(serializers.ModelSerializer):
@@ -104,8 +107,63 @@ class CopyExecutionSerializer(serializers.ModelSerializer):
         )
 
 
+class SignalCandidateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SignalCandidate
+        fields = (
+            "symbol", "direction", "target_hint", "reason", "status",
+            "reviewed_at", "created_at",
+        )
+
+
+class SignalCandidateReviewSerializer(serializers.Serializer):
+    action = serializers.ChoiceField(choices=("APPROVE", "REJECT"))
+    entry_price = serializers.DecimalField(
+        max_digits=32, decimal_places=12, min_value=Decimal("0.000000000001"), required=False
+    )
+    stop_loss = serializers.DecimalField(
+        max_digits=32, decimal_places=12, min_value=Decimal("0.000000000001"), required=False
+    )
+    take_profit = serializers.DecimalField(
+        max_digits=32, decimal_places=12, min_value=Decimal("0.000000000001"), required=False
+    )
+    leverage = serializers.IntegerField(min_value=1, max_value=125, required=False)
+    confirm_live = serializers.BooleanField(default=False, write_only=True)
+
+    def validate(self, attrs):
+        if attrs["action"] == "REJECT":
+            return attrs
+        missing = [
+            field for field in ("entry_price", "stop_loss", "take_profit")
+            if field not in attrs
+        ]
+        if missing:
+            raise serializers.ValidationError({field: "This field is required." for field in missing})
+        candidate = self.context["candidate"]
+        if (
+            candidate.message.strategy.mode == CopyStrategy.Mode.LIVE
+            and not attrs.get("confirm_live")
+        ):
+            raise serializers.ValidationError({
+                "confirm_live": "Confirm that this approval may place a real Binance order."
+            })
+        entry = attrs["entry_price"]
+        stop = attrs["stop_loss"]
+        target = attrs["take_profit"]
+        if candidate.direction == TradeSignal.Direction.LONG and not stop < entry < target:
+            raise serializers.ValidationError(
+                "LONG review requires stop loss below entry and take profit above entry."
+            )
+        if candidate.direction == TradeSignal.Direction.SHORT and not target < entry < stop:
+            raise serializers.ValidationError(
+                "SHORT review requires take profit below entry and stop loss above entry."
+            )
+        return attrs
+
+
 class TelegramMessageSerializer(serializers.ModelSerializer):
     signal = TradeSignalSerializer(read_only=True)
+    candidate = serializers.SerializerMethodField()
     execution = serializers.SerializerMethodField()
     media_url = serializers.SerializerMethodField()
 
@@ -113,7 +171,7 @@ class TelegramMessageSerializer(serializers.ModelSerializer):
         model = TelegramMessage
         fields = (
             "telegram_message_id", "sender_name", "text", "sent_at", "parse_status",
-            "signal", "execution", "media_type", "media_mime_type", "media_size", "media_url",
+            "signal", "candidate", "execution", "media_type", "media_mime_type", "media_size", "media_url",
         )
 
     def get_media_url(self, obj):
@@ -129,6 +187,10 @@ class TelegramMessageSerializer(serializers.ModelSerializer):
             None,
         )
         return CopyExecutionSerializer(execution).data if execution else None
+
+    def get_candidate(self, obj):
+        candidate = getattr(obj, "signal_candidate", None)
+        return SignalCandidateSerializer(candidate).data if candidate else None
 
 
 class CopyStrategySerializer(serializers.ModelSerializer):

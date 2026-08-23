@@ -5,6 +5,7 @@ from .views import (
     CopyPositionsAPIView, PaperReplayAPIView,
     StrategyDetailAPIView, StrategyListCreateAPIView, StrategyMessagesAPIView,
     StrategyNotificationsAPIView,
+    SignalCandidateReviewAPIView,
     TelegramConnectionAPIView, TelegramMessageMediaAPIView, TelegramStartAPIView,
     TelegramVerifyAPIView,
 )
@@ -23,6 +24,10 @@ urlpatterns = [
     path(
         "strategies/<uuid:strategy_id>/notifications/",
         StrategyNotificationsAPIView.as_view(),
+    ),
+    path(
+        "strategies/<uuid:strategy_id>/messages/<int:message_id>/review/",
+        SignalCandidateReviewAPIView.as_view(),
     ),
     path(
         "strategies/<uuid:strategy_id>/messages/<int:message_id>/media/",

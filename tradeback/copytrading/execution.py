@@ -9,9 +9,9 @@ from django.utils import timezone
 from exchanges.models import ExchangeAccount, TradeLog
 from exchanges.services import BinanceService, BinanceServiceError, decimal_to_string, get_bracket_for_notional
 
-from .models import CopyExecution, CopyStrategy, TelegramMessage, TradeSignal
+from .models import CopyExecution, CopyStrategy, SignalCandidate, TelegramMessage, TradeSignal
 from .ai_detection import analyze_signal_candidate
-from .parser import SignalParseError, parse_signal, signal_symbol_hint
+from .parser import SignalParseError, parse_signal, parse_signal_candidate, signal_symbol_hint
 
 
 MULTIPART_SIGNAL_WINDOW = timedelta(minutes=5)
@@ -140,6 +140,18 @@ def _process_saved_message(strategy, message, execute):
         parsed = analyze_signal_candidate(strategy, message.text)
         ai_parsed = parsed is not None
     if parsed is None:
+        candidate = parse_signal_candidate(message.text) if execute else None
+        if candidate:
+            message.parse_status = TelegramMessage.ParseStatus.REVIEW
+            message.save(update_fields=("parse_status",))
+            SignalCandidate.objects.create(
+                message=message,
+                symbol=candidate.symbol,
+                direction=candidate.direction,
+                target_hint=candidate.target_hint,
+                reason=candidate.reason,
+            )
+            return message, None, None
         if direct_parse_failed:
             message.parse_status = TelegramMessage.ParseStatus.INVALID
             message.save(update_fields=("parse_status",))

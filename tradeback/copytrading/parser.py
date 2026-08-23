@@ -14,6 +14,14 @@ class ParsedSignal:
     leverage: int | None
 
 
+@dataclass(frozen=True)
+class ParsedSignalCandidate:
+    symbol: str
+    direction: str
+    target_hint: str
+    reason: str
+
+
 class SignalParseError(ValueError):
     pass
 
@@ -21,6 +29,11 @@ class SignalParseError(ValueError):
 NUMBER = r"(\d+(?:\.\d+)?)"
 SIGNAL_SYMBOL = re.compile(
     r"#(?:FUTURE\s+#)?([A-Z0-9]{2,15})(?:/USDT)?\b",
+    re.IGNORECASE,
+)
+EARLY_SIGNAL = re.compile(
+    r"#([A-Z0-9]{2,15})(?:/USDT)?\s+HAS\s+(?:A\s+)?"
+    r"(LONG|SHORT|BUY|SELL)\s+SIGNAL\b",
     re.IGNORECASE,
 )
 
@@ -49,13 +62,17 @@ def parse_signal(text):
     if any(marker in upper for marker in ("TARGET DONE", "ALL TARGET", "BOOK 50%", "MOVE SL")):
         return None
 
-    header = re.search(r"#(?:FUTURE\s+#)?([A-Z0-9]{2,15})(?:/USDT)?\s*[-:]?\s*(LONG|SHORT)\b", upper)
+    header = re.search(
+        r"#(?:FUTURE\s+#)?([A-Z0-9]{2,15})(?:/USDT)?\s*[-:]?\s*#?\s*"
+        r"(LONG|SHORT|BUY|SELL)\b",
+        upper,
+    )
     if not header:
         return None
 
     asset = header.group(1)
     symbol = asset if asset.endswith("USDT") else f"{asset}USDT"
-    direction = header.group(2)
+    direction = {"BUY": "LONG", "SELL": "SHORT"}.get(header.group(2), header.group(2))
     entry_match = re.search(r"\bENTR(?:Y|IES)\s*:\s*([^\n]+)", upper)
     target_match = re.search(r"\bTARGETS?\s*:\s*([^\n]+)", upper)
     stop_match = re.search(r"\b(?:SL|STOP\s*LOSS|STOPLOSS)\s*:\s*([^\n]+)", upper)
@@ -85,3 +102,31 @@ def parse_signal(text):
         raise SignalParseError("Leverage must be between 1x and 125x.")
 
     return ParsedSignal(symbol, direction, low, high, stop, targets, leverage)
+
+
+def parse_signal_candidate(text):
+    """Detect explicit early alerts that need user-supplied risk parameters."""
+    normalized = (text or "").replace("–", "-").replace("—", "-").strip()
+    upper = normalized.upper()
+    if any(marker in upper for marker in (
+        "IS FLYING", "PUMPING", "TARGET DONE", "ALL TARGET", "BOOK 50%", "MOVE SL",
+    )):
+        return None
+    match = EARLY_SIGNAL.search(normalized)
+    if not match:
+        return None
+    asset = match.group(1).upper()
+    symbol = asset if asset.endswith("USDT") else f"{asset}USDT"
+    raw_direction = match.group(2).upper()
+    direction = {"BUY": "LONG", "SELL": "SHORT"}.get(raw_direction, raw_direction)
+    target = re.search(
+        r"(?:POSSIBLE\s+)?TARGET\s*:?[\s$]*([0-9][0-9.,]*)\s*\$?",
+        normalized,
+        re.IGNORECASE,
+    )
+    return ParsedSignalCandidate(
+        symbol=symbol,
+        direction=direction,
+        target_hint=target.group(1) if target else "",
+        reason="Early signal alert is missing a confirmed entry or stop-loss.",
+    )

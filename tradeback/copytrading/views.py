@@ -12,11 +12,15 @@ from rest_framework.views import APIView
 
 from .execution import execute_signal
 from .ai_detection import AISignalError, verify_agent
-from .models import AISignalAgent, CopyExecution, CopyStrategy, TelegramConnection, TelegramMessage
+from .models import (
+    AISignalAgent, CopyExecution, CopyStrategy, SignalCandidate, TelegramConnection,
+    TelegramMessage, TradeSignal,
+)
 from .positions import cancel_pending_entry, close_paper_position, get_position_payload
 from .serializers import (
     CopyStrategyCreateSerializer, CopyStrategySerializer, CopyStrategyUpdateSerializer,
     AISignalAgentConnectSerializer, AISignalAgentSerializer, CopyExecutionSerializer,
+    SignalCandidateReviewSerializer,
     TelegramConnectionSerializer, TelegramMessageSerializer, TelegramStartSerializer,
     TelegramVerifySerializer,
 )
@@ -182,7 +186,9 @@ class StrategyDetailAPIView(CopyTradingAPIView):
 class StrategyMessagesAPIView(CopyTradingAPIView):
     def get(self, request, strategy_id):
         strategy = get_object_or_404(CopyStrategy, id=strategy_id, user=request.user)
-        rows = TelegramMessage.objects.filter(strategy=strategy).select_related("signal").prefetch_related("signal__executions")
+        rows = TelegramMessage.objects.filter(strategy=strategy).select_related(
+            "signal", "signal_candidate"
+        ).prefetch_related("signal__executions")
         try:
             page_size = min(max(int(request.query_params.get("page_size", 20)), 1), 50)
         except (TypeError, ValueError):
@@ -220,7 +226,7 @@ class StrategyNotificationsAPIView(CopyTradingAPIView):
 
         rows = list(
             rows.filter(telegram_message_id__gt=strategy.last_notified_message_id)
-            .select_related("signal")
+            .select_related("signal", "signal_candidate")
             .prefetch_related("signal__executions")
             .order_by("telegram_message_id")[: page_size + 1]
         )
@@ -247,6 +253,59 @@ class StrategyNotificationsAPIView(CopyTradingAPIView):
                 locked.last_notified_message_id = message_id
                 locked.save(update_fields=("last_notified_message_id", "updated_at"))
         return Response({"last_notified_message_id": locked.last_notified_message_id})
+
+
+class SignalCandidateReviewAPIView(CopyTradingAPIView):
+    def post(self, request, strategy_id, message_id):
+        candidate = get_object_or_404(
+            SignalCandidate.objects.select_related("message__strategy"),
+            message__strategy_id=strategy_id,
+            message__strategy__user=request.user,
+            message__telegram_message_id=message_id,
+        )
+        serializer = SignalCandidateReviewSerializer(
+            data=request.data,
+            context={"candidate": candidate},
+        )
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        with transaction.atomic():
+            candidate = SignalCandidate.objects.select_for_update().select_related(
+                "message__strategy"
+            ).get(pk=candidate.pk)
+            if candidate.status != SignalCandidate.Status.PENDING:
+                return Response(
+                    {"detail": f"This signal suggestion is already {candidate.status.lower()}."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            candidate.reviewed_at = timezone.now()
+            if data["action"] == "REJECT":
+                candidate.status = SignalCandidate.Status.REJECTED
+                candidate.save(update_fields=("status", "reviewed_at"))
+                return Response({"status": candidate.status, "reviewed_at": candidate.reviewed_at})
+
+            signal = TradeSignal.objects.create(
+                message=candidate.message,
+                symbol=candidate.symbol,
+                direction=candidate.direction,
+                entry_low=data["entry_price"],
+                entry_high=data["entry_price"],
+                stop_loss=data["stop_loss"],
+                take_profits=[format(data["take_profit"], "f")],
+                requested_leverage=data.get("leverage"),
+                parser_version="user-review-v1",
+            )
+            candidate.status = SignalCandidate.Status.APPROVED
+            candidate.save(update_fields=("status", "reviewed_at"))
+            candidate.message.parse_status = TelegramMessage.ParseStatus.SIGNAL
+            candidate.message.save(update_fields=("parse_status",))
+
+        execute_signal(candidate.message.strategy, signal)
+        message = TelegramMessage.objects.select_related(
+            "signal", "signal_candidate"
+        ).prefetch_related("signal__executions").get(pk=candidate.message_id)
+        return Response(TelegramMessageSerializer(message).data)
 
 
 class TelegramMessageMediaAPIView(CopyTradingAPIView):

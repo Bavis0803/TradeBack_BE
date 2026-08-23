@@ -130,6 +130,7 @@ class CopyStrategy(models.Model):
 class TelegramMessage(models.Model):
     class ParseStatus(models.TextChoices):
         SIGNAL = "SIGNAL", "Trading signal"
+        REVIEW = "REVIEW", "Needs user review"
         IGNORED = "IGNORED", "Ignored"
         INVALID = "INVALID", "Invalid signal"
 
@@ -177,6 +178,29 @@ class TradeSignal(models.Model):
     requested_leverage = models.PositiveSmallIntegerField(null=True, blank=True)
     parser_version = models.CharField(max_length=16, default="chn-v1")
     created_at = models.DateTimeField(auto_now_add=True)
+
+
+class SignalCandidate(models.Model):
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Waiting for review"
+        APPROVED = "APPROVED", "Approved"
+        REJECTED = "REJECTED", "Rejected"
+
+    message = models.OneToOneField(
+        TelegramMessage, on_delete=models.CASCADE, related_name="signal_candidate"
+    )
+    symbol = models.CharField(max_length=32)
+    direction = models.CharField(max_length=8, choices=TradeSignal.Direction.choices)
+    target_hint = models.CharField(max_length=64, blank=True)
+    reason = models.CharField(max_length=255)
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.PENDING)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=("status", "-created_at"), name="signal_candidate_status_idx"),
+        ]
 
 
 class AISignalAnalysis(models.Model):
