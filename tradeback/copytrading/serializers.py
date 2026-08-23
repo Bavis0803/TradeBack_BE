@@ -62,6 +62,7 @@ class CopyExecutionSerializer(serializers.ModelSerializer):
             "id", "status", "symbol", "direction", "entry_price", "quantity", "leverage",
             "margin_usdt", "stop_loss", "take_profit", "error", "created_at",
             "position_status", "exit_price", "realized_pnl", "close_reason", "closed_at",
+            "entry_order_type", "limit_price", "entry_expires_at",
         )
 
 
@@ -99,6 +100,7 @@ class CopyStrategySerializer(serializers.ModelSerializer):
             "id", "chat_id", "chat_title", "chat_username", "mode", "status",
             "allocation_usdt", "max_leverage", "max_daily_loss_usdt", "allowed_symbols",
             "use_binance_max_leverage", "entry_tolerance_percent",
+            "entry_order_type", "limit_expiry_minutes",
             "last_message_id", "last_error", "created_at", "updated_at",
         )
         read_only_fields = ("id", "chat_id", "chat_title", "chat_username", "last_message_id", "last_error")
@@ -113,6 +115,10 @@ class CopyStrategyCreateSerializer(serializers.Serializer):
     entry_tolerance_percent = serializers.DecimalField(
         max_digits=5, decimal_places=3, min_value=0, max_value=2, default=Decimal("0.300")
     )
+    entry_order_type = serializers.ChoiceField(
+        choices=CopyStrategy.EntryOrderType.choices, default=CopyStrategy.EntryOrderType.LIMIT
+    )
+    limit_expiry_minutes = serializers.IntegerField(min_value=11, max_value=120, default=15)
     allowed_symbols = serializers.ListField(
         child=serializers.RegexField(r"^[A-Z0-9]{2,20}USDT$"), required=False, default=list
     )
@@ -138,6 +144,7 @@ class CopyStrategyUpdateSerializer(serializers.ModelSerializer):
         fields = (
             "mode", "status", "allocation_usdt", "max_leverage", "max_daily_loss_usdt",
             "allowed_symbols", "use_binance_max_leverage", "entry_tolerance_percent",
+            "entry_order_type", "limit_expiry_minutes",
             "confirm_live",
         )
 
@@ -149,7 +156,9 @@ class CopyStrategyUpdateSerializer(serializers.ModelSerializer):
         if (
             mode != self.instance.mode
             and self.instance.executions.filter(
-                position_status=CopyExecution.PositionStatus.OPEN
+                position_status__in=(
+                    CopyExecution.PositionStatus.OPEN, CopyExecution.PositionStatus.PENDING,
+                )
             ).exists()
         ):
             raise serializers.ValidationError({

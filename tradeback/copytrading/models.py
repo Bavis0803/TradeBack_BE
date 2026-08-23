@@ -42,6 +42,10 @@ class CopyStrategy(models.Model):
         PAUSED = "PAUSED", "Paused"
         ERROR = "ERROR", "Error"
 
+    class EntryOrderType(models.TextChoices):
+        MARKET = "MARKET", "Market entry"
+        LIMIT = "LIMIT", "Limit entry"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="copy_strategies"
@@ -69,6 +73,12 @@ class CopyStrategy(models.Model):
         decimal_places=3,
         default=Decimal("0.300"),
         validators=[MinValueValidator(0), MaxValueValidator(2)],
+    )
+    entry_order_type = models.CharField(
+        max_length=8, choices=EntryOrderType.choices, default=EntryOrderType.MARKET
+    )
+    limit_expiry_minutes = models.PositiveSmallIntegerField(
+        default=15, validators=[MinValueValidator(11), MaxValueValidator(120)]
     )
     allowed_symbols = models.JSONField(default=list, blank=True)
     last_message_id = models.BigIntegerField(null=True, blank=True)
@@ -143,11 +153,14 @@ class CopyExecution(models.Model):
         PROTECTED = "PROTECTED", "TP/SL protected"
         SKIPPED = "SKIPPED", "Skipped by risk checks"
         FAILED = "FAILED", "Failed"
+        PENDING_ENTRY = "PENDING_ENTRY", "Waiting for limit entry"
+        CANCELLED = "CANCELLED", "Entry cancelled"
 
     class PositionStatus(models.TextChoices):
         NONE = "NONE", "No position"
         OPEN = "OPEN", "Open"
         CLOSED = "CLOSED", "Closed"
+        PENDING = "PENDING", "Pending entry"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     strategy = models.ForeignKey(CopyStrategy, on_delete=models.CASCADE, related_name="executions")
@@ -162,6 +175,9 @@ class CopyExecution(models.Model):
     stop_loss = models.DecimalField(max_digits=32, decimal_places=12)
     take_profit = models.DecimalField(max_digits=32, decimal_places=12)
     entry_order_id = models.CharField(max_length=64, blank=True)
+    entry_order_type = models.CharField(max_length=8, default=CopyStrategy.EntryOrderType.MARKET)
+    limit_price = models.DecimalField(max_digits=32, decimal_places=12, null=True, blank=True)
+    entry_expires_at = models.DateTimeField(null=True, blank=True)
     stop_order_id = models.CharField(max_length=64, blank=True)
     take_profit_order_id = models.CharField(max_length=64, blank=True)
     error = models.CharField(max_length=500, blank=True)

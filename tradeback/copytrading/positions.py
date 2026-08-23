@@ -6,7 +6,7 @@ from django.utils import timezone
 
 from exchanges.services import BinanceService, BinanceServiceError, decimal_to_string
 
-from .execution import _binance_for_user
+from .execution import _binance_for_user, protect_live_execution
 from .models import CopyExecution, CopyStrategy
 
 
@@ -48,10 +48,123 @@ def _paper_trigger(execution, mark_price):
     return None
 
 
+def _cancel_pending(execution, reason="LIMIT_EXPIRED"):
+    execution.status = CopyExecution.Status.CANCELLED
+    execution.position_status = CopyExecution.PositionStatus.NONE
+    execution.close_reason = reason
+    execution.closed_at = timezone.now()
+    execution.save(update_fields=(
+        "status", "position_status", "close_reason", "closed_at", "updated_at",
+    ))
+    return execution
+
+
+def _fill_paper_limit(execution):
+    execution.status = CopyExecution.Status.PAPER_FILLED
+    execution.position_status = CopyExecution.PositionStatus.OPEN
+    execution.entry_price = execution.limit_price
+    execution.save(update_fields=(
+        "status", "position_status", "entry_price", "updated_at",
+    ))
+    trade_log = execution.trade_log
+    if trade_log is None:
+        from exchanges.models import TradeLog
+        trade_log = TradeLog.objects.create(
+            user=execution.strategy.user,
+            account=execution.strategy.user.exchange_accounts.filter(
+                exchange="BINANCE", status="CONNECTED"
+            ).first(),
+            source=TradeLog.Source.DRAFT, status=TradeLog.Status.DRAFT,
+            market=TradeLog.Market.FUTURES, symbol=execution.symbol,
+            side="BUY" if execution.direction == "LONG" else "SELL",
+            price=execution.entry_price, quantity=execution.quantity,
+            quote_quantity=execution.entry_price * execution.quantity,
+            stop_loss=execution.stop_loss, take_profit=execution.take_profit,
+            leverage=execution.leverage,
+            note=f"Telegram paper limit copy: {execution.strategy.chat_title}",
+            executed_at=timezone.now(),
+        )
+        execution.trade_log = trade_log
+        execution.save(update_fields=("trade_log", "updated_at"))
+    return execution
+
+
+def reconcile_pending_entries(user):
+    """Advance pending LIMIT orders independently from any open browser tab."""
+    pending = list(
+        CopyExecution.objects.filter(
+            strategy__user=user,
+            status=CopyExecution.Status.PENDING_ENTRY,
+            position_status=CopyExecution.PositionStatus.PENDING,
+        ).select_related("strategy")
+    )
+    if not pending:
+        return
+
+    paper = [item for item in pending if item.strategy.mode == CopyStrategy.Mode.PAPER]
+    if paper:
+        try:
+            marks = BinanceService().get_futures_mark_prices({item.symbol for item in paper})
+        except BinanceServiceError:
+            marks = {}
+        for execution in paper:
+            mark = marks.get(execution.symbol)
+            fillable = mark is not None and (
+                (execution.direction == "LONG" and mark <= execution.limit_price)
+                or (execution.direction == "SHORT" and mark >= execution.limit_price)
+            )
+            if fillable:
+                _fill_paper_limit(execution)
+            elif execution.entry_expires_at and timezone.now() >= execution.entry_expires_at:
+                _cancel_pending(execution)
+
+    live = [item for item in pending if item.strategy.mode == CopyStrategy.Mode.LIVE]
+    if not live:
+        return
+    try:
+        _, client = _binance_for_user(user)
+    except Exception:
+        return
+    terminal = {"CANCELED", "EXPIRED", "REJECTED"}
+    for execution in live:
+        try:
+            order = client.get_futures_order(execution.symbol, execution.entry_order_id)
+            expired = execution.entry_expires_at and timezone.now() >= execution.entry_expires_at
+            executed_quantity = Decimal(str(order.get("executedQty") or "0"))
+            if (
+                (expired or order.get("status") == "PARTIALLY_FILLED")
+                and order.get("status") not in {"FILLED", *terminal}
+            ):
+                client.cancel_futures_order(execution.symbol, execution.entry_order_id)
+                order = client.get_futures_order(execution.symbol, execution.entry_order_id)
+                executed_quantity = Decimal(str(order.get("executedQty") or executed_quantity))
+            if order.get("status") == "FILLED" or (
+                order.get("status") in terminal and executed_quantity > 0
+            ):
+                average_price = Decimal(str(order.get("avgPrice") or "0"))
+                if average_price <= 0:
+                    average_price = execution.limit_price
+                protect_live_execution(execution, client, executed_quantity, average_price)
+            elif order.get("status") in terminal or expired:
+                _cancel_pending(execution)
+        except BinanceServiceError as exc:
+            execution.error = str(exc)[:500]
+            execution.save(update_fields=("error", "updated_at"))
+
+
+def cancel_pending_entry(execution):
+    execution.entry_expires_at = timezone.now()
+    execution.save(update_fields=("entry_expires_at", "updated_at"))
+    reconcile_pending_entries(execution.strategy.user)
+    execution.refresh_from_db()
+    return execution
+
+
 def get_position_payload(user, strategy_id=None):
     rows = CopyExecution.objects.filter(strategy__user=user).select_related("strategy", "signal")
     if strategy_id:
         rows = rows.filter(strategy_id=strategy_id)
+    pending_rows = list(rows.filter(position_status=CopyExecution.PositionStatus.PENDING).order_by("-created_at"))
     open_rows = list(rows.filter(position_status=CopyExecution.PositionStatus.OPEN).order_by("-created_at"))
     recent_rows = list(rows.filter(position_status=CopyExecution.PositionStatus.CLOSED).order_by("-closed_at")[:10])
     symbols = {item.symbol for item in open_rows}
@@ -95,6 +208,7 @@ def get_position_payload(user, strategy_id=None):
         snapshots.append(_serialize(execution, mark, live))
 
     return {
+        "pending": [_serialize(item, item.limit_price or item.entry_price) for item in pending_rows],
         "open": snapshots,
         "recent": [_serialize(item, item.exit_price or item.entry_price) for item in recent_rows[:10]],
         "updated_at": timezone.now().isoformat(),
@@ -135,4 +249,7 @@ def _serialize(execution, mark_price, live=None):
         "opened_at": execution.created_at.isoformat(),
         "closed_at": execution.closed_at.isoformat() if execution.closed_at else None,
         "price_source": "BINANCE_ACCOUNT" if live else "BINANCE_MARK_PRICE",
+        "entry_order_type": execution.entry_order_type,
+        "limit_price": decimal_to_string(execution.limit_price) if execution.limit_price else None,
+        "entry_expires_at": execution.entry_expires_at.isoformat() if execution.entry_expires_at else None,
     }

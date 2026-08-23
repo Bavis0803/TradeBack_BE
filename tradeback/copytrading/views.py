@@ -11,7 +11,7 @@ from rest_framework.views import APIView
 
 from .execution import execute_signal
 from .models import CopyExecution, CopyStrategy, TelegramConnection, TelegramMessage
-from .positions import close_paper_position, get_position_payload
+from .positions import cancel_pending_entry, close_paper_position, get_position_payload
 from .serializers import (
     CopyStrategyCreateSerializer, CopyStrategySerializer, CopyStrategyUpdateSerializer,
     CopyExecutionSerializer, TelegramConnectionSerializer, TelegramMessageSerializer, TelegramStartSerializer,
@@ -119,6 +119,11 @@ class StrategyDetailAPIView(CopyTradingAPIView):
 
     def delete(self, request, strategy_id):
         strategy = get_object_or_404(CopyStrategy, id=strategy_id, user=request.user)
+        if strategy.executions.filter(position_status__in=("OPEN", "PENDING")).exists():
+            return Response(
+                {"detail": "Close open positions and cancel pending entries before deleting this stream."},
+                status=409,
+            )
         strategy.delete()
         return Response(status=204)
 
@@ -255,4 +260,15 @@ class ClosePaperPositionAPIView(CopyTradingAPIView):
             execution.refresh_from_db()
             return Response(CopyExecutionSerializer(execution).data)
         execution = close_paper_position(execution, Decimal(current["mark_price"]), "MANUAL")
+        return Response(CopyExecutionSerializer(execution).data)
+
+
+class CancelPendingEntryAPIView(CopyTradingAPIView):
+    def post(self, request, execution_id):
+        execution = get_object_or_404(
+            CopyExecution.objects.select_related("strategy"),
+            id=execution_id, strategy__user=request.user,
+            position_status=CopyExecution.PositionStatus.PENDING,
+        )
+        execution = cancel_pending_entry(execution)
         return Response(CopyExecutionSerializer(execution).data)

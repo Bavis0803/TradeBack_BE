@@ -244,6 +244,7 @@ class BinanceService:
         ticker = self._request_json("/fapi/v2/ticker/price", {"symbol": symbol})
         filters = {item["filterType"]: item for item in symbol_info.get("filters", [])}
         lot_size = filters.get("LOT_SIZE", {})
+        price_filter = filters.get("PRICE_FILTER", {})
         min_notional_filter = filters.get("MIN_NOTIONAL", {})
         context = {
             "symbol": symbol,
@@ -255,6 +256,7 @@ class BinanceService:
             "min_volume": Decimal(lot_size.get("minQty", "0")),
             "max_volume": Decimal(lot_size.get("maxQty", "0")),
             "volume_step": Decimal(lot_size.get("stepSize", "0")),
+            "price_step": Decimal(price_filter.get("tickSize", "0")),
             "min_notional": Decimal(
                 min_notional_filter.get("notional", min_notional_filter.get("minNotional", "0"))
             ),
@@ -307,6 +309,17 @@ class BinanceService:
     def place_futures_algo_order(self, **params):
         return self._request_json(
             "/fapi/v1/algoOrder", params, signed=True, method="POST"
+        )
+
+    def get_futures_order(self, symbol, order_id):
+        return self._request_json(
+            "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}, signed=True
+        )
+
+    def cancel_futures_order(self, symbol, order_id):
+        return self._request_json(
+            "/fapi/v1/order", {"symbol": symbol, "orderId": order_id},
+            signed=True, method="DELETE",
         )
 
 

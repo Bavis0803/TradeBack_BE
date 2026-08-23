@@ -15,7 +15,7 @@ from .execution import process_telegram_message, reprocess_saved_message
 from .models import CopyExecution, CopyStrategy, TelegramConnection, TelegramMessage
 from .parser import SignalParseError, parse_signal
 from .telegram import chat_reference_candidates, get_strategy_telegram_connection
-from .positions import get_position_payload
+from .positions import get_position_payload, reconcile_pending_entries
 
 
 CHN_SIGNAL = """#FUTURE #ZEC LONG ( leverage x20 )
@@ -80,6 +80,33 @@ class FakeBinance:
 
     def get_usdt_balance(self):
         return Decimal("500")
+
+
+class FakeLiveBinance(FakeBinance):
+    def __init__(self, current_price=Decimal("523.1")):
+        super().__init__(current_price)
+        self.orders = []
+        self.order_status = {
+            "status": "NEW", "executedQty": "0", "avgPrice": "0", "orderId": 9001,
+        }
+
+    def change_initial_leverage(self, symbol, leverage):
+        return {"leverage": leverage}
+
+    def place_futures_order(self, **params):
+        self.orders.append(params)
+        return {**self.order_status, "orderId": 9001}
+
+    def place_futures_algo_order(self, **params):
+        self.orders.append(params)
+        return {"algoId": len(self.orders) + 100}
+
+    def get_futures_order(self, symbol, order_id):
+        return self.order_status
+
+    def cancel_futures_order(self, symbol, order_id):
+        self.order_status = {**self.order_status, "status": "CANCELED"}
+        return self.order_status
 
 
 class CopyExecutionTests(TestCase):
@@ -225,6 +252,95 @@ class CopyExecutionTests(TestCase):
         self.assertIn("Current Binance price 523.1", execution.error)
         self.assertIn("0.3% tolerance", execution.error)
         self.assertIn("accepted 519.9355-523.0645", execution.error)
+
+    @patch("copytrading.positions.BinanceService.get_futures_mark_prices")
+    @patch("copytrading.execution._binance_for_user")
+    def test_paper_limit_waits_for_retrace_then_opens(self, mock_client, mock_marks):
+        mock_client.return_value = (self.account, FakeBinance(Decimal("523.1")))
+        self.strategy.entry_order_type = CopyStrategy.EntryOrderType.LIMIT
+        self.strategy.save(update_fields=("entry_order_type",))
+
+        execution = process_telegram_message(
+            self.strategy, 108, CHN_SIGNAL, timezone.now()
+        )[2]
+        self.assertEqual(execution.status, CopyExecution.Status.PENDING_ENTRY)
+        self.assertEqual(execution.limit_price, Decimal("521.5"))
+
+        mock_marks.return_value = {"ZECUSDT": Decimal("521.4")}
+        reconcile_pending_entries(self.user)
+        execution.refresh_from_db()
+        self.assertEqual(execution.position_status, CopyExecution.PositionStatus.OPEN)
+        self.assertEqual(execution.status, CopyExecution.Status.PAPER_FILLED)
+
+    @patch("copytrading.positions.BinanceService.get_futures_mark_prices")
+    @patch("copytrading.execution._binance_for_user")
+    def test_unfilled_paper_limit_expires_without_opening(self, mock_client, mock_marks):
+        mock_client.return_value = (self.account, FakeBinance(Decimal("523.1")))
+        mock_marks.return_value = {"ZECUSDT": Decimal("523.1")}
+        self.strategy.entry_order_type = CopyStrategy.EntryOrderType.LIMIT
+        self.strategy.save(update_fields=("entry_order_type",))
+        execution = process_telegram_message(
+            self.strategy, 110, CHN_SIGNAL, timezone.now()
+        )[2]
+        execution.entry_expires_at = timezone.now() - timedelta(seconds=1)
+        execution.save(update_fields=("entry_expires_at",))
+
+        reconcile_pending_entries(self.user)
+        execution.refresh_from_db()
+        self.assertEqual(execution.status, CopyExecution.Status.CANCELLED)
+        self.assertEqual(execution.position_status, CopyExecution.PositionStatus.NONE)
+
+    @override_settings(COPY_TRADING_LIVE_ENABLED=True)
+    @patch("copytrading.positions._binance_for_user")
+    @patch("copytrading.execution._binance_for_user")
+    def test_live_limit_is_protected_only_after_fill(self, mock_execute_client, mock_position_client):
+        fake = FakeLiveBinance()
+        mock_execute_client.return_value = (self.account, fake)
+        mock_position_client.return_value = (self.account, fake)
+        self.strategy.mode = CopyStrategy.Mode.LIVE
+        self.strategy.entry_order_type = CopyStrategy.EntryOrderType.LIMIT
+        self.strategy.save(update_fields=("mode", "entry_order_type"))
+
+        execution = process_telegram_message(
+            self.strategy, 109, CHN_SIGNAL, timezone.now()
+        )[2]
+        self.assertEqual(execution.position_status, CopyExecution.PositionStatus.PENDING)
+        self.assertEqual(fake.orders[0]["type"], "LIMIT")
+        self.assertEqual(fake.orders[0]["timeInForce"], "GTD")
+        self.assertGreater(fake.orders[0]["goodTillDate"], int(timezone.now().timestamp() * 1000))
+        self.assertEqual(len(fake.orders), 1)
+
+        fake.order_status = {
+            "status": "FILLED", "executedQty": str(execution.quantity),
+            "avgPrice": "521.5", "orderId": 9001,
+        }
+        reconcile_pending_entries(self.user)
+        execution.refresh_from_db()
+        self.assertEqual(execution.status, CopyExecution.Status.PROTECTED)
+        self.assertEqual(execution.position_status, CopyExecution.PositionStatus.OPEN)
+        self.assertEqual([item["type"] for item in fake.orders[1:]], ["STOP_MARKET", "TAKE_PROFIT_MARKET"])
+
+    @override_settings(COPY_TRADING_LIVE_ENABLED=True)
+    @patch("copytrading.execution._binance_for_user")
+    def test_partial_live_limit_cancels_remainder_and_protects_fill(self, mock_client):
+        fake = FakeLiveBinance()
+        fake.order_status = {
+            "status": "PARTIALLY_FILLED", "executedQty": "0.005",
+            "avgPrice": "521.5", "orderId": 9001,
+        }
+        mock_client.return_value = (self.account, fake)
+        self.strategy.mode = CopyStrategy.Mode.LIVE
+        self.strategy.entry_order_type = CopyStrategy.EntryOrderType.LIMIT
+        self.strategy.save(update_fields=("mode", "entry_order_type"))
+
+        execution = process_telegram_message(
+            self.strategy, 111, CHN_SIGNAL, timezone.now()
+        )[2]
+
+        self.assertEqual(execution.status, CopyExecution.Status.PROTECTED)
+        self.assertEqual(execution.quantity, Decimal("0.005"))
+        self.assertEqual(fake.order_status["status"], "CANCELED")
+        self.assertEqual([item["type"] for item in fake.orders[1:]], ["STOP_MARKET", "TAKE_PROFIT_MARKET"])
 
     def test_history_import_parses_but_never_executes_old_signal(self):
         message, signal, execution = process_telegram_message(

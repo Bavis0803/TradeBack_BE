@@ -31,6 +31,12 @@ def _floor_step(value, step):
     return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
+def _limit_price(signal, context):
+    # Use the edge nearest the breakout so a retrace has the highest safe fill chance.
+    raw = signal.entry_high if signal.direction == "LONG" else signal.entry_low
+    return _floor_step(raw, context.get("price_step"))
+
+
 def _accepted_entry_range(strategy, signal):
     tolerance = Decimal(str(strategy.entry_tolerance_percent)) / Decimal("100")
     return (
@@ -167,7 +173,9 @@ def execute_signal(strategy, signal, paper_replay=False):
     if CopyExecution.objects.filter(
         strategy__user=strategy.user,
         symbol=signal.symbol,
-        position_status=CopyExecution.PositionStatus.OPEN,
+        position_status__in=(
+            CopyExecution.PositionStatus.OPEN, CopyExecution.PositionStatus.PENDING,
+        ),
     ).exists():
         return _skip(strategy, signal, signal.entry_low, "An open copy position already exists for this symbol.")
 
@@ -208,7 +216,10 @@ def execute_signal(strategy, signal, paper_replay=False):
     market_price = context["current_price"]
     price = signal.entry_low if paper_replay and strategy.mode == CopyStrategy.Mode.PAPER else market_price
     accepted_low, accepted_high = _accepted_entry_range(strategy, signal)
-    if not paper_replay and not accepted_low <= price <= accepted_high:
+    if (
+        strategy.entry_order_type == CopyStrategy.EntryOrderType.MARKET
+        and not paper_replay and not accepted_low <= price <= accepted_high
+    ):
         return _skip(
             strategy,
             signal,
@@ -242,21 +253,34 @@ def execute_signal(strategy, signal, paper_replay=False):
     strategy_cap = binance_symbol_max if strategy.use_binance_max_leverage else strategy.max_leverage
     requested = signal.requested_leverage or strategy_cap
     leverage = min(requested, strategy_cap, 125)
+    order_type = (
+        CopyStrategy.EntryOrderType.MARKET
+        if paper_replay else strategy.entry_order_type
+    )
+    order_price = price if order_type == CopyStrategy.EntryOrderType.MARKET else _limit_price(signal, context)
     tentative_notional = allocation * leverage
     leverage = min(leverage, get_bracket_for_notional(brackets, tentative_notional)["initial_leverage"])
     notional = allocation * leverage
-    quantity = _floor_step(notional / price, context["volume_step"])
+    quantity = _floor_step(notional / order_price, context["volume_step"])
     take_profit = Decimal(str(signal.take_profits[0]))
-    if quantity < context["min_volume"] or price * quantity < context["min_notional"]:
+    if quantity < context["min_volume"] or order_price * quantity < context["min_notional"]:
         return _skip(strategy, signal, price, "Allocation is below Binance minimum order size.")
 
-    if strategy.mode == CopyStrategy.Mode.PAPER:
+    limit_marketable = (
+        signal.direction == "LONG" and price <= order_price
+    ) or (
+        signal.direction == "SHORT" and price >= order_price
+    )
+    if strategy.mode == CopyStrategy.Mode.PAPER and (
+        order_type == CopyStrategy.EntryOrderType.MARKET or limit_marketable
+    ):
         execution = CopyExecution.objects.create(
             strategy=strategy, signal=signal, status=CopyExecution.Status.PAPER_FILLED,
             position_status=CopyExecution.PositionStatus.OPEN,
             symbol=signal.symbol, direction=signal.direction, entry_price=price,
             quantity=quantity, leverage=leverage, margin_usdt=allocation,
             stop_loss=signal.stop_loss, take_profit=take_profit,
+            entry_order_type=order_type,
         )
         trade_log = TradeLog.objects.create(
             user=strategy.user, account=account, source=TradeLog.Source.DRAFT,
@@ -270,6 +294,17 @@ def execute_signal(strategy, signal, paper_replay=False):
         execution.trade_log = trade_log
         execution.save(update_fields=("trade_log", "updated_at"))
         return execution
+
+    if strategy.mode == CopyStrategy.Mode.PAPER:
+        return CopyExecution.objects.create(
+            strategy=strategy, signal=signal, status=CopyExecution.Status.PENDING_ENTRY,
+            position_status=CopyExecution.PositionStatus.PENDING,
+            symbol=signal.symbol, direction=signal.direction, entry_price=order_price,
+            limit_price=order_price, quantity=quantity, leverage=leverage,
+            margin_usdt=allocation, stop_loss=signal.stop_loss, take_profit=take_profit,
+            entry_order_type=CopyStrategy.EntryOrderType.LIMIT,
+            entry_expires_at=timezone.now() + timedelta(minutes=strategy.limit_expiry_minutes),
+        )
 
     if not settings.COPY_TRADING_LIVE_ENABLED:
         return _skip(strategy, signal, price, "Live copy trading is disabled by the server kill-switch.")
@@ -287,9 +322,48 @@ def execute_signal(strategy, signal, paper_replay=False):
         symbol=signal.symbol, direction=signal.direction, entry_price=price,
         quantity=quantity, leverage=leverage, margin_usdt=allocation,
         stop_loss=signal.stop_loss, take_profit=take_profit,
+        entry_order_type=order_type,
+        limit_price=order_price if order_type == CopyStrategy.EntryOrderType.LIMIT else None,
+        entry_expires_at=(
+            timezone.now() + timedelta(minutes=strategy.limit_expiry_minutes)
+            if order_type == CopyStrategy.EntryOrderType.LIMIT else None
+        ),
     )
     try:
         client.change_initial_leverage(signal.symbol, leverage)
+        if order_type == CopyStrategy.EntryOrderType.LIMIT:
+            entry = client.place_futures_order(
+                symbol=signal.symbol, side=side, type="LIMIT", timeInForce="GTD",
+                price=decimal_to_string(order_price), quantity=decimal_to_string(quantity),
+                goodTillDate=int(execution.entry_expires_at.timestamp() * 1000),
+                newOrderRespType="RESULT", newClientOrderId=f"tb-{execution.id.hex[:28]}",
+            )
+            execution.entry_order_id = str(entry.get("orderId", ""))
+            execution.status = CopyExecution.Status.PENDING_ENTRY
+            execution.position_status = CopyExecution.PositionStatus.PENDING
+            execution.save()
+            if entry.get("status") != "FILLED":
+                try:
+                    entry = client.get_futures_order(signal.symbol, execution.entry_order_id)
+                except BinanceServiceError:
+                    pass
+            filled_quantity = Decimal(str(entry.get("executedQty") or "0"))
+            if entry.get("status") == "PARTIALLY_FILLED" and filled_quantity > 0:
+                client.cancel_futures_order(signal.symbol, execution.entry_order_id)
+                entry = client.get_futures_order(signal.symbol, execution.entry_order_id)
+                filled_quantity = Decimal(str(entry.get("executedQty") or filled_quantity))
+            if entry.get("status") == "FILLED" or filled_quantity > 0:
+                average_price = Decimal(str(entry.get("avgPrice") or "0"))
+                if average_price <= 0:
+                    average_price = order_price
+                return protect_live_execution(execution, client, filled_quantity, average_price)
+            if entry.get("status") in {"CANCELED", "EXPIRED", "REJECTED"}:
+                execution.status = CopyExecution.Status.CANCELLED
+                execution.position_status = CopyExecution.PositionStatus.NONE
+                execution.close_reason = "BINANCE_CANCELLED"
+                execution.closed_at = timezone.now()
+                execution.save()
+            return execution
         entry = client.place_futures_order(
             symbol=signal.symbol, side=side, type="MARKET",
             quantity=decimal_to_string(quantity), newClientOrderId=f"tb-{execution.id.hex[:28]}",
@@ -318,6 +392,52 @@ def execute_signal(strategy, signal, paper_replay=False):
                 client.place_futures_order(
                     symbol=signal.symbol, side=closing_side, type="MARKET",
                     quantity=decimal_to_string(quantity), reduceOnly="true",
+                )
+            except BinanceServiceError:
+                execution.error = (execution.error + " Emergency close also failed; check Binance now.")[:500]
+            else:
+                execution.position_status = CopyExecution.PositionStatus.CLOSED
+                execution.close_reason = "EMERGENCY_CLOSE"
+                execution.closed_at = timezone.now()
+    execution.save()
+    return execution
+
+
+@transaction.atomic
+def protect_live_execution(execution, client, filled_quantity, average_price):
+    """Attach reduce-only protection after a MARKET or LIMIT entry has actually filled."""
+    execution = CopyExecution.objects.select_for_update().get(pk=execution.pk)
+    if execution.status == CopyExecution.Status.PROTECTED:
+        return execution
+    side = "BUY" if execution.direction == "LONG" else "SELL"
+    closing_side = "SELL" if side == "BUY" else "BUY"
+    execution.quantity = filled_quantity
+    execution.entry_price = average_price
+    execution.position_status = CopyExecution.PositionStatus.OPEN
+    execution.status = CopyExecution.Status.SUBMITTED
+    try:
+        stop = client.place_futures_algo_order(
+            algoType="CONDITIONAL", symbol=execution.symbol, side=closing_side,
+            type="STOP_MARKET", triggerPrice=decimal_to_string(execution.stop_loss),
+            quantity=decimal_to_string(filled_quantity), reduceOnly="true", workingType="MARK_PRICE",
+        )
+        execution.stop_order_id = str(stop.get("algoId", ""))
+        target = client.place_futures_algo_order(
+            algoType="CONDITIONAL", symbol=execution.symbol, side=closing_side,
+            type="TAKE_PROFIT_MARKET", triggerPrice=decimal_to_string(execution.take_profit),
+            quantity=decimal_to_string(filled_quantity), reduceOnly="true", workingType="MARK_PRICE",
+        )
+        execution.take_profit_order_id = str(target.get("algoId", ""))
+        execution.status = CopyExecution.Status.PROTECTED
+        execution.error = ""
+    except BinanceServiceError as exc:
+        execution.status = CopyExecution.Status.FAILED
+        execution.error = str(exc)[:500]
+        if not execution.stop_order_id:
+            try:
+                client.place_futures_order(
+                    symbol=execution.symbol, side=closing_side, type="MARKET",
+                    quantity=decimal_to_string(filled_quantity), reduceOnly="true",
                 )
             except BinanceServiceError:
                 execution.error = (execution.error + " Emergency close also failed; check Binance now.")[:500]

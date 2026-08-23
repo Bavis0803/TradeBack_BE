@@ -287,10 +287,18 @@ async def _catch_up(client, connection, on_processed=None):
 
 
 async def _reconcile_loop(client, connection, on_processed):
+    from .positions import reconcile_pending_entries
+    ticks = 0
     while client.is_connected():
-        await asyncio.sleep(20)
-        await _catch_up(client, connection, on_processed)
-        await sync_to_async(get_position_payload, thread_sensitive=True)(connection.user)
+        await asyncio.sleep(2)
+        try:
+            await sync_to_async(reconcile_pending_entries, thread_sensitive=True)(connection.user)
+        except Exception:
+            logger.exception("Pending LIMIT reconciliation failed for Telegram connection %s.", connection.id)
+        ticks += 1
+        if ticks % 10 == 0:
+            await _catch_up(client, connection, on_processed)
+            await sync_to_async(get_position_payload, thread_sensitive=True)(connection.user)
 
 
 async def listen_connection(connection, on_processed=None):
