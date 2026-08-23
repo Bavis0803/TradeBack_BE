@@ -152,6 +152,37 @@ class BinanceService:
             cache.set(cache_key, payload, timeout=15)
         return payload
 
+    def get_futures_klines(
+        self, symbol, interval, start_time=None, end_time=None, limit=1500
+    ):
+        params = {
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "limit": min(max(int(limit), 1), 1500),
+        }
+        if start_time is not None:
+            params["startTime"] = int(start_time)
+        if end_time is not None:
+            params["endTime"] = int(end_time)
+        return self._request_json("/fapi/v1/klines", params)
+
+    def get_top_futures_symbols(self, limit=20):
+        exchange_info = self.get_exchange_info()
+        active = {
+            item["symbol"]
+            for item in exchange_info.get("symbols", [])
+            if item.get("contractType") == "PERPETUAL"
+            and item.get("quoteAsset") == "USDT"
+            and item.get("status") == "TRADING"
+        }
+        tickers = self.get_futures_tickers()
+        ranked = sorted(
+            (item for item in tickers if item.get("symbol") in active),
+            key=lambda item: Decimal(str(item.get("quoteVolume", "0"))),
+            reverse=True,
+        )
+        return [item["symbol"] for item in ranked[: min(max(int(limit), 1), 100)]]
+
     def get_futures_mark_prices(self, symbols=None):
         cache_key = f"binance-futures-mark-prices:{self.base_url}"
         payload = cache.get(cache_key)

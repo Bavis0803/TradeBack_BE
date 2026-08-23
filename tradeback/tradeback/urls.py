@@ -28,4 +28,5 @@ urlpatterns = [
     path('user/', include('user.urls')),
     path('exchange/', include('exchanges.urls')),
     path('copy-trading/', include('copytrading.urls')),
+    path('strategies/', include('strategy_lab.urls')),
 ]

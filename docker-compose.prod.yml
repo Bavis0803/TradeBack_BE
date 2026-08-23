@@ -37,6 +37,7 @@ services:
       DB_PORT: "5432"
       REDIS_URL: redis://redis:6379/0
       COPY_TRADING_LIVE_ENABLED: "True"
+      STRATEGY_LIVE_ENABLED: ${STRATEGY_LIVE_ENABLED:-True}
       ALLOWED_HOSTS: ${ALLOWED_HOSTS:?ALLOWED_HOSTS is required}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:?CORS_ALLOWED_ORIGINS is required}
       CSRF_TRUSTED_ORIGINS: ${CSRF_TRUSTED_ORIGINS:?CSRF_TRUSTED_ORIGINS is required}
@@ -71,6 +72,16 @@ services:
     command: python manage.py run_telegram_worker
     volumes:
       - media_data:/app/media
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  strategy-worker:
+    build: .
+    restart: unless-stopped
+    env_file: ./.env
+    environment: *backend_environment
+    command: python manage.py run_strategy_worker
     depends_on:
       backend:
         condition: service_healthy

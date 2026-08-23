@@ -1,7 +1,7 @@
 # TradeBack deployment
 
 The production stack contains PostgreSQL, Redis, Django ASGI, one Telegram
-listener worker, and React behind Nginx. For one user, use at least 2 vCPU,
+listener worker, a Strategy training/execution worker, and React behind Nginx. For one user, use at least 2 vCPU,
 4 GB RAM, and 40 GB SSD on Ubuntu 24.04 LTS.
 
 ## Jenkins one-click deployment
@@ -24,6 +24,12 @@ the real domain in `ALLOWED_HOSTS`, and HTTPS URLs in both origin lists.
 global LIVE capability only: each stream still requires explicit confirmation
 and remains protected by symbol, balance, entry, leverage, daily-loss, TP/SL,
 idempotency, and emergency-close checks.
+
+Set `STRATEGY_LIVE_ENABLED=True` to permit trained strategies to place real
+Binance Futures orders and set `STRATEGY_MAX_BUDGET_USDT` to an account-level
+server cap. LIVE activation still requires a verified Binance connection and
+an explicit confirmation. The `strategy-worker` keeps backtests and PAPER/LIVE
+execution running when the browser is closed.
 
 The frontend and WebSocket use the same public origin. Nginx forwards all API
 and `/ws/` traffic to Django, so the browser never calls Binance or Telegram

@@ -56,6 +56,7 @@ INSTALLED_APPS = [
     "rest_framework_simplejwt",
     "channels",
     "copytrading",
+    "strategy_lab",
 ]
 
 MIDDLEWARE = [
@@ -148,6 +149,9 @@ REST_FRAMEWORK = {
         "transaction_sync": "6/minute",
         "copy_trading": "60/minute",
         "telegram_auth": "10/minute",
+        "strategy_lab": "90/minute",
+        "strategy_training": "8/hour",
+        "strategy_positions": "120/minute",
     },
 }
 
@@ -230,6 +234,8 @@ COPY_TRADING_MEDIA_MAX_BYTES = config(
 COPY_TRADING_SIGNAL_MAX_AGE_SECONDS = config(
     "COPY_TRADING_SIGNAL_MAX_AGE_SECONDS", cast=int, default=300
 )
+STRATEGY_LIVE_ENABLED = config("STRATEGY_LIVE_ENABLED", cast=bool, default=False)
+STRATEGY_MAX_BUDGET_USDT = config("STRATEGY_MAX_BUDGET_USDT", cast=float, default=5000)
 MEDIA_ROOT = BASE_DIR / "media"
 
 LOG_LEVEL = config("LOG_LEVEL", default="INFO")
