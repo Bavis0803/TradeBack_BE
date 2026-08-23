@@ -83,6 +83,46 @@ class StrategyAPITests(TestCase):
         }, format="json")
         self.assertEqual(response.status_code, 201, response.data)
 
+    def test_active_execution_protects_strategy_edit_and_delete(self):
+        strategy = StrategyDefinition.objects.create(
+            user=self.user, parsed_spec=compile_strategy(
+                CODE, "ta.crossover(fast, slow)", "ta.crossunder(fast, slow)"
+            ), status=StrategyDefinition.Status.TRAINED, **self.payload,
+        )
+        run = StrategyTrainingRun.objects.create(
+            strategy=strategy, status=StrategyTrainingRun.Status.COMPLETED
+        )
+        StrategyRuntime.objects.create(
+            user=self.user, strategy=strategy, training_run=run,
+            mode=StrategyRuntime.Mode.PAPER, status=StrategyRuntime.Status.ACTIVE,
+            symbols=["BTCUSDT"], timeframes=["15m"], allocation_per_order=10,
+            total_budget=100, max_daily_loss=25, leverage=2, max_open_positions=2,
+        )
+        patch_response = self.client.patch(
+            f"/strategies/definitions/{strategy.id}/", {"name": "unsafe edit"}, format="json"
+        )
+        delete_response = self.client.delete(f"/strategies/definitions/{strategy.id}/")
+        self.assertEqual(patch_response.status_code, 409)
+        self.assertEqual(delete_response.status_code, 409)
+
+    def test_paused_execution_without_positions_can_be_deleted(self):
+        strategy = StrategyDefinition.objects.create(
+            user=self.user, parsed_spec=compile_strategy(
+                CODE, "ta.crossover(fast, slow)", "ta.crossunder(fast, slow)"
+            ), status=StrategyDefinition.Status.TRAINED, **self.payload,
+        )
+        run = StrategyTrainingRun.objects.create(
+            strategy=strategy, status=StrategyTrainingRun.Status.COMPLETED
+        )
+        runtime = StrategyRuntime.objects.create(
+            user=self.user, strategy=strategy, training_run=run,
+            mode=StrategyRuntime.Mode.PAPER, status=StrategyRuntime.Status.PAUSED,
+            symbols=["BTCUSDT"], timeframes=["15m"], allocation_per_order=10,
+            total_budget=100, max_daily_loss=25, leverage=2, max_open_positions=2,
+        )
+        response = self.client.delete(f"/strategies/executions/{runtime.id}/")
+        self.assertEqual(response.status_code, 204)
+
     @override_settings(STRATEGY_LIVE_ENABLED=True)
     def test_live_requires_confirm_and_connected_binance(self):
         strategy = StrategyDefinition.objects.create(
