@@ -18,6 +18,7 @@ from .serializers import (
     TrainingRunSerializer,
 )
 from .training import SUPPORTED_TIMEFRAMES, queue_training
+from .serializers import MAX_STRATEGY_SYMBOLS
 
 
 class StrategyAPIView(APIView):
@@ -33,6 +34,7 @@ class StrategyCatalogAPIView(StrategyAPIView):
             return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
         return Response({
             "default_symbols": symbols,
+            "max_symbols": MAX_STRATEGY_SYMBOLS,
             "timeframes": list(SUPPORTED_TIMEFRAMES),
             "supported_indicators": ["ta.sma", "ta.ema", "ta.rsi", "ta.atr"],
             "supported_triggers": ["ta.crossover", "ta.crossunder", "and", "or", "not"],
@@ -43,6 +45,23 @@ class StrategyCatalogAPIView(StrategyAPIView):
             ),
             "default_long_condition": "ta.crossover(fast, slow) and rsi < 70",
             "default_short_condition": "ta.crossunder(fast, slow) and rsi > 30",
+        })
+
+
+class StrategySymbolValidationAPIView(StrategyAPIView):
+    def get(self, request):
+        symbol = request.query_params.get("symbol", "").upper().replace("/", "").strip()
+        if symbol and not symbol.endswith("USDT"):
+            symbol = f"{symbol}USDT"
+        if not symbol or not symbol.isalnum():
+            return Response({"valid": False, "symbol": symbol, "detail": "Enter a valid coin symbol."})
+        try:
+            valid = symbol in BinanceService().get_active_futures_symbols()
+        except BinanceServiceError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        return Response({
+            "valid": valid, "symbol": symbol,
+            "detail": "Active Binance USDT perpetual." if valid else "This coin is not an active Binance USDT perpetual.",
         })
 
 

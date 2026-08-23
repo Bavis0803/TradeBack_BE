@@ -183,6 +183,15 @@ class BinanceService:
         )
         return [item["symbol"] for item in ranked[: min(max(int(limit), 1), 100)]]
 
+    def get_active_futures_symbols(self):
+        return {
+            item["symbol"]
+            for item in self.get_exchange_info().get("symbols", [])
+            if item.get("contractType") == "PERPETUAL"
+            and item.get("quoteAsset") == "USDT"
+            and item.get("status") == "TRADING"
+        }
+
     def get_futures_mark_prices(self, symbols=None):
         cache_key = f"binance-futures-mark-prices:{self.base_url}"
         payload = cache.get(cache_key)

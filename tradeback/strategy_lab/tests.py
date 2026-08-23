@@ -45,6 +45,12 @@ class StrategyAPITests(TestCase):
         )
         self.client = APIClient()
         self.client.force_authenticate(self.user)
+        self.symbol_patcher = patch(
+            "strategy_lab.serializers.BinanceService.get_active_futures_symbols",
+            return_value={"BTCUSDT", "ETHUSDT"},
+        )
+        self.symbol_patcher.start()
+        self.addCleanup(self.symbol_patcher.stop)
         self.payload = {
             "name": "EMA cross", "indicator_code": CODE,
             "long_condition": "ta.crossover(fast, slow)",
@@ -61,6 +67,17 @@ class StrategyAPITests(TestCase):
         )
         self.assertEqual(queued.status_code, 202)
         self.assertEqual(queued.data["status"], StrategyTrainingRun.Status.QUEUED)
+
+    @patch(
+        "strategy_lab.views.BinanceService.get_active_futures_symbols",
+        return_value={"BTCUSDT", "PENGUUSDT"},
+    )
+    def test_custom_symbol_validation_uses_binance_contracts(self, _symbols):
+        valid = self.client.get("/strategies/catalog/symbol/?symbol=PENGU")
+        invalid = self.client.get("/strategies/catalog/symbol/?symbol=NOTREAL")
+        self.assertTrue(valid.data["valid"])
+        self.assertEqual(valid.data["symbol"], "PENGUUSDT")
+        self.assertFalse(invalid.data["valid"])
 
     def test_training_builds_report_and_unlocks_paper_execution(self):
         strategy = StrategyDefinition.objects.create(

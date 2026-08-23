@@ -5,6 +5,7 @@ from rest_framework import serializers
 
 from exchanges.connection import get_binance_account
 from exchanges.models import ExchangeAccount
+from exchanges.services import BinanceService, BinanceServiceError
 
 from .engine import StrategyCompileError, compile_strategy
 from .models import (
@@ -12,6 +13,8 @@ from .models import (
     StrategyTrainingRun,
 )
 from .training import SUPPORTED_TIMEFRAMES
+
+MAX_STRATEGY_SYMBOLS = 30
 
 
 class StrategyDefinitionSerializer(serializers.ModelSerializer):
@@ -35,8 +38,8 @@ class StrategyDefinitionSerializer(serializers.ModelSerializer):
         return str(run.id) if run else None
 
     def validate_symbols(self, value):
-        if len(value) > 20:
-            raise serializers.ValidationError("Select at most 20 symbols per strategy.")
+        if len(value) > MAX_STRATEGY_SYMBOLS:
+            raise serializers.ValidationError(f"Select at most {MAX_STRATEGY_SYMBOLS} symbols per strategy.")
         normalized = []
         for item in value:
             symbol = str(item).upper().replace("/", "").strip()
@@ -44,6 +47,15 @@ class StrategyDefinitionSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(f"Invalid USDT perpetual symbol: {item}.")
             if symbol not in normalized:
                 normalized.append(symbol)
+        try:
+            active = BinanceService().get_active_futures_symbols()
+        except BinanceServiceError as exc:
+            raise serializers.ValidationError("Binance is unavailable; symbols could not be validated.") from exc
+        invalid = [symbol for symbol in normalized if symbol not in active]
+        if invalid:
+            raise serializers.ValidationError(
+                f"Not an active Binance USDT perpetual: {', '.join(invalid)}."
+            )
         return normalized
 
     def validate_timeframes(self, value):

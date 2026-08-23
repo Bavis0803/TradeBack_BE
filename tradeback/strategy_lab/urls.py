@@ -2,6 +2,7 @@ from django.urls import path
 
 from .views import (
     ClosePaperStrategyPositionAPIView, StrategyCatalogAPIView,
+    StrategySymbolValidationAPIView,
     StrategyDefinitionDetailAPIView, StrategyDefinitionListCreateAPIView,
     StrategyPositionListAPIView, StrategyRuntimeDetailAPIView,
     StrategyRuntimeListCreateAPIView, StrategyTrainAPIView, TrainingRunDetailAPIView,
@@ -9,6 +10,7 @@ from .views import (
 
 urlpatterns = [
     path("catalog/", StrategyCatalogAPIView.as_view()),
+    path("catalog/symbol/", StrategySymbolValidationAPIView.as_view()),
     path("definitions/", StrategyDefinitionListCreateAPIView.as_view()),
     path("definitions/<uuid:strategy_id>/", StrategyDefinitionDetailAPIView.as_view()),
     path("definitions/<uuid:strategy_id>/train/", StrategyTrainAPIView.as_view()),
