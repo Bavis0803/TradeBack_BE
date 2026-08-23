@@ -19,6 +19,7 @@ from .serializers import (
 )
 from .training import SUPPORTED_TIMEFRAMES, queue_training
 from .serializers import MAX_STRATEGY_SYMBOLS
+from .engine import StrategyCompileError, compile_strategy
 
 
 class StrategyAPIView(APIView):
@@ -36,8 +37,16 @@ class StrategyCatalogAPIView(StrategyAPIView):
             "default_symbols": symbols,
             "max_symbols": MAX_STRATEGY_SYMBOLS,
             "timeframes": list(SUPPORTED_TIMEFRAMES),
-            "supported_indicators": ["ta.sma", "ta.ema", "ta.rsi", "ta.atr"],
-            "supported_triggers": ["ta.crossover", "ta.crossunder", "and", "or", "not"],
+            "supported_indicators": [
+                "ta.sma", "ta.ema", "ta.rma", "ta.wma", "ta.hma", "ta.vwma",
+                "ta.rsi", "ta.atr", "ta.stdev", "ta.highest", "ta.lowest",
+                "ta.change", "ta.roc", "ta.mom", "ta.macd", "ta.bb",
+                "Supertrend + BOS stateful profile",
+            ],
+            "supported_triggers": [
+                "ta.crossover", "ta.crossunder", "history [n]", "ternary ?: ",
+                "nz", "math.abs/min/max", "and", "or", "not",
+            ],
             "template": (
                 "//@version=6\nindicator(\"EMA + RSI\", overlay=true)\n"
                 "fast = ta.ema(close, 9)\nslow = ta.ema(close, 21)\n"
@@ -62,6 +71,31 @@ class StrategySymbolValidationAPIView(StrategyAPIView):
         return Response({
             "valid": valid, "symbol": symbol,
             "detail": "Active Binance USDT perpetual." if valid else "This coin is not an active Binance USDT perpetual.",
+        })
+
+
+class StrategyCompileAPIView(StrategyAPIView):
+    throttle_scope = "strategy_training"
+
+    def post(self, request):
+        try:
+            spec = compile_strategy(
+                str(request.data.get("indicator_code", "")),
+                str(request.data.get("long_condition", "")),
+                str(request.data.get("short_condition", "")),
+            )
+        except StrategyCompileError as exc:
+            return Response({"valid": False, "detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        names = []
+        for indicator in spec.get("indicators", []):
+            names.extend(indicator.get("names", [indicator.get("name")]))
+        names.extend(item["name"] for item in spec.get("expressions", []))
+        return Response({
+            "valid": True,
+            "engine": spec.get("engine", "safe_series_v2"),
+            "profile_name": spec.get("profile_name", "Pine-compatible series strategy"),
+            "computed_series": [name for name in names if name],
+            "detail": "Code compiled successfully and is ready for backtesting.",
         })
 
 

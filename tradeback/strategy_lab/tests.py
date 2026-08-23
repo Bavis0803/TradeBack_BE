@@ -5,12 +5,42 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
-from .engine import StrategyCompileError, backtest, compile_strategy
+from .engine import StrategyCompileError, backtest, build_series, compile_strategy
 from .models import StrategyDefinition, StrategyRuntime, StrategyTrainingRun
 from .training import process_training_run, queue_training
 
 
 CODE = "fast = ta.ema(close, 3)\nslow = ta.ema(close, 8)\nrsi = ta.rsi(close, 4)"
+SUPER_BOS_CODE = """
+//@version=6
+strategy("Supertrend + Market Structure BOS Strategy", overlay=true)
+atrPeriod = input.int(10, "ATR Period")
+atrMultiplier = input.float(3.0, "ATR Multiplier")
+useWilderATR = input.bool(true, "Use Wilder ATR")
+pivotLeft = input.int(5, "Pivot bars left")
+pivotRight = input.int(5, "Pivot bars right")
+breakConfirmation = input.string("Close", "Breakout confirmation")
+acceptChoch = input.bool(false, "Accept CHoCH")
+trailWithSupertrend = input.bool(true, "Trail")
+closeOnOppositeST = input.bool(false, "Opposite")
+enableLongs = input.bool(true, "Long")
+enableShorts = input.bool(true, "Short")
+riskPct = input.float(1.0, "Risk")
+riskReward = input.float(2.0, "RR")
+maxPositionPct = input.float(100.0, "Maximum")
+pivotHigh = ta.pivothigh(high, pivotLeft, pivotRight)
+pivotLow = ta.pivotlow(low, pivotLeft, pivotRight)
+upBand := close[1] > previousUp ? math.max(upRaw, previousUp) : upRaw
+downBand := close[1] < previousDown ? math.min(downRaw, previousDown) : downRaw
+var bool longArmed = false
+var bool shortArmed = false
+bullBreak = not na(lastSwingHigh) and not swingHighBroken and close > lastSwingHigh
+bearBreak = not na(lastSwingLow) and not swingLowBroken and close < lastSwingLow
+longEntry = enableLongs and inDateRange and strategy.position_size == 0 and longArmed
+shortEntry = enableShorts and inDateRange and strategy.position_size == 0 and shortArmed
+strategy.entry("Long", strategy.long)
+strategy.exit("Long SL/TP", "Long")
+"""
 
 
 def candles(count=120):
@@ -36,6 +66,31 @@ class StrategyEngineTests(TestCase):
     def test_rejects_arbitrary_code(self):
         with self.assertRaises(StrategyCompileError):
             compile_strategy("x = request.security('X', '1D', close)", "x > close")
+
+    def test_compiles_stateful_supertrend_bos_profile(self):
+        spec = compile_strategy(SUPER_BOS_CODE, "longEntry", "shortEntry")
+        self.assertEqual(spec["engine"], "supertrend_bos_v1")
+        self.assertEqual(spec["config"]["pivot_left"], 5)
+        series = build_series(candles(300), spec)
+        self.assertEqual(len(series["longEntry"]), 300)
+        result = backtest(candles(300), spec, Decimal("2"), Decimal("1"))
+        self.assertEqual(result["bars_tested"], 300)
+
+    def test_compiles_advanced_series_and_multi_output_indicators(self):
+        code = """
+src = input.source(hl2, "Source")
+fast = ta.hma(src, 9)
+[basis, upper, lower] = ta.bb(close, 20, 2)
+[macdLine, signalLine, histogram] = ta.macd(close, 12, 26, 9)
+momentum = close - close[1]
+confirmed = close > basis ? momentum : 0
+"""
+        spec = compile_strategy(
+            code, "close > upper and confirmed > 0", "close < lower and histogram < 0"
+        )
+        series = build_series(candles(120), spec)
+        self.assertIn("histogram", series)
+        self.assertIn("confirmed", series)
 
 
 class StrategyAPITests(TestCase):
@@ -78,6 +133,15 @@ class StrategyAPITests(TestCase):
         self.assertTrue(valid.data["valid"])
         self.assertEqual(valid.data["symbol"], "PENGUUSDT")
         self.assertFalse(invalid.data["valid"])
+
+    def test_compile_endpoint_recognizes_stateful_supertrend_bos(self):
+        response = self.client.post("/strategies/compile/", {
+            "indicator_code": SUPER_BOS_CODE,
+            "long_condition": "longEntry", "short_condition": "shortEntry",
+        }, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertTrue(response.data["valid"])
+        self.assertEqual(response.data["engine"], "supertrend_bos_v1")
 
     def test_training_builds_report_and_unlocks_paper_execution(self):
         strategy = StrategyDefinition.objects.create(

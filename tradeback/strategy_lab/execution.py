@@ -116,7 +116,10 @@ def update_runtime_positions(runtime, client=None):
             position.save(update_fields=("current_price", "unrealized_pnl", "updated_at"))
 
 
-def _open_position(runtime, symbol, timeframe, candle_time, direction, price, client=None):
+def _open_position(
+    runtime, symbol, timeframe, candle_time, direction, price, client=None,
+    signal_stop=None,
+):
     strategy = runtime.strategy
     if runtime.positions.filter(status=StrategyPosition.Status.OPEN).count() >= runtime.max_open_positions:
         return None
@@ -158,8 +161,12 @@ def _open_position(runtime, symbol, timeframe, candle_time, direction, price, cl
     )
     if quantity < context["min_volume"] or quantity * price < context["min_notional"]:
         raise BinanceServiceError("Strategy allocation is below Binance minimum order size.")
-    risk = price * strategy.stop_loss_percent / Decimal("100")
-    stop = price - risk if direction == "LONG" else price + risk
+    stop = Decimal(str(signal_stop)) if signal_stop is not None else None
+    valid_signal_stop = stop is not None and (
+        (direction == "LONG" and stop < price) or (direction == "SHORT" and stop > price)
+    )
+    risk = abs(price - stop) if valid_signal_stop else price * strategy.stop_loss_percent / Decimal("100")
+    stop = stop if valid_signal_stop else (price - risk if direction == "LONG" else price + risk)
     target = (
         price + risk * strategy.risk_reward_ratio
         if direction == "LONG" else price - risk * strategy.risk_reward_ratio
@@ -188,7 +195,7 @@ def _open_position(runtime, symbol, timeframe, candle_time, direction, price, cl
         position.entry_order_id = str(entry.get("orderId", ""))
         fill_price = Decimal(str(entry.get("avgPrice") or entry.get("price") or price))
         if fill_price > 0:
-            live_risk = fill_price * strategy.stop_loss_percent / Decimal("100")
+            live_risk = risk if valid_signal_stop else fill_price * strategy.stop_loss_percent / Decimal("100")
             stop = fill_price - live_risk if direction == "LONG" else fill_price + live_risk
             target = (
                 fill_price + live_risk * strategy.risk_reward_ratio
@@ -266,10 +273,14 @@ def process_runtime(runtime):
                 )
                 cursors[key] = candle["close_time"]
                 if long_signal != short_signal:
+                    signal_stop = None
+                    if runtime.strategy.parsed_spec.get("engine") == "supertrend_bos_v1":
+                        band_name = "upBand" if long_signal else "downBand"
+                        signal_stop = series[band_name][index]
                     _open_position(
                         runtime, symbol, timeframe, candle["close_time"],
                         "LONG" if long_signal else "SHORT",
-                        Decimal(str(candle["close"])), client,
+                        Decimal(str(candle["close"])), client, signal_stop,
                     )
         runtime.last_candles = cursors
         runtime.last_error = ""
