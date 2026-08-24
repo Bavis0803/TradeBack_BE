@@ -1,6 +1,7 @@
 from decimal import Decimal
 from datetime import timedelta
 
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
@@ -179,7 +180,11 @@ def get_position_payload(user, strategy_id=None):
         try:
             _, client = _binance_for_user(user)
             live_positions = {
-                item["symbol"]: item for item in client.get_futures_positions()
+                (
+                    item["symbol"],
+                    "LONG" if Decimal(str(item.get("positionAmt", "0"))) > 0 else "SHORT",
+                ): item
+                for item in client.get_futures_positions()
                 if Decimal(str(item.get("positionAmt", "0"))) != 0
             }
             live_sync_ok = True
@@ -187,18 +192,35 @@ def get_position_payload(user, strategy_id=None):
             live_positions = {}
 
     snapshots = []
+    now = timezone.now()
+    missing_grace = timedelta(
+        seconds=max(
+            int(getattr(settings, "COPY_TRADING_POSITION_MISSING_GRACE_SECONDS", 45)),
+            10,
+        )
+    )
     for execution in open_rows:
-        live = live_positions.get(execution.symbol) if execution.strategy.mode == CopyStrategy.Mode.LIVE else None
+        live = (
+            live_positions.get((execution.symbol, execution.direction))
+            if execution.strategy.mode == CopyStrategy.Mode.LIVE else None
+        )
         mark = Decimal(str(live.get("markPrice"))) if live else marks.get(execution.symbol, execution.entry_price)
-        if (
-            execution.strategy.mode == CopyStrategy.Mode.LIVE
-            and live_sync_ok
-            and live is None
-            and timezone.now() - execution.created_at > timedelta(seconds=10)
-        ):
-            execution = close_paper_position(execution, mark, "BINANCE_SYNC")
-            recent_rows.insert(0, execution)
-            continue
+        if execution.strategy.mode == CopyStrategy.Mode.LIVE and live_sync_ok:
+            if live is not None:
+                if execution.binance_missing_since is not None or execution.last_binance_seen_at is None:
+                    execution.binance_missing_since = None
+                    execution.last_binance_seen_at = now
+                    execution.save(update_fields=(
+                        "binance_missing_since", "last_binance_seen_at", "updated_at",
+                    ))
+            else:
+                if execution.binance_missing_since is None:
+                    execution.binance_missing_since = now
+                    execution.save(update_fields=("binance_missing_since", "updated_at"))
+                elif now - execution.binance_missing_since >= missing_grace:
+                    execution = close_paper_position(execution, mark, "BINANCE_SYNC")
+                    recent_rows.insert(0, execution)
+                    continue
         if execution.strategy.mode == CopyStrategy.Mode.PAPER:
             trigger = _paper_trigger(execution, mark)
             if trigger:
@@ -249,6 +271,18 @@ def _serialize(execution, mark_price, live=None):
         "opened_at": execution.created_at.isoformat(),
         "closed_at": execution.closed_at.isoformat() if execution.closed_at else None,
         "price_source": "BINANCE_ACCOUNT" if live else "BINANCE_MARK_PRICE",
+        "sync_status": (
+            "CONFIRMED" if live else
+            "RECONNECTING" if (
+                execution.strategy.mode == CopyStrategy.Mode.LIVE
+                and execution.binance_missing_since is not None
+            ) else
+            "MARK_PRICE"
+        ),
+        "binance_missing_since": (
+            execution.binance_missing_since.isoformat()
+            if execution.binance_missing_since else None
+        ),
         "entry_order_type": execution.entry_order_type,
         "limit_price": decimal_to_string(execution.limit_price) if execution.limit_price else None,
         "entry_expires_at": execution.entry_expires_at.isoformat() if execution.entry_expires_at else None,

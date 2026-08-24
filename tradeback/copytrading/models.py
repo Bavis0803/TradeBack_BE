@@ -279,6 +279,8 @@ class CopyExecution(models.Model):
     realized_pnl = models.DecimalField(max_digits=32, decimal_places=12, default=0)
     close_reason = models.CharField(max_length=32, blank=True)
     closed_at = models.DateTimeField(null=True, blank=True)
+    last_binance_seen_at = models.DateTimeField(null=True, blank=True)
+    binance_missing_since = models.DateTimeField(null=True, blank=True)
     trade_log = models.OneToOneField(
         "exchanges.TradeLog", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="copy_execution",

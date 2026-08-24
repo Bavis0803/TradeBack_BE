@@ -113,6 +113,7 @@ class FakeLiveBinance(FakeBinance):
         self.order_status = {
             "status": "NEW", "executedQty": "0", "avgPrice": "0", "orderId": 9001,
         }
+        self.positions = []
 
     def change_initial_leverage(self, symbol, leverage):
         return {"leverage": leverage}
@@ -131,6 +132,9 @@ class FakeLiveBinance(FakeBinance):
     def cancel_futures_order(self, symbol, order_id):
         self.order_status = {**self.order_status, "status": "CANCELED"}
         return self.order_status
+
+    def get_futures_positions(self):
+        return self.positions
 
 
 class CopyExecutionTests(TestCase):
@@ -563,6 +567,105 @@ class CopyExecutionTests(TestCase):
         self.assertEqual(position["status"], "OPEN")
         self.assertGreater(Decimal(position["unrealized_pnl"]), 0)
         self.assertGreater(Decimal(position["roe_percent"]), 0)
+
+    @override_settings(
+        COPY_TRADING_LIVE_ENABLED=True,
+        COPY_TRADING_POSITION_MISSING_GRACE_SECONDS=30,
+    )
+    @patch("copytrading.positions.BinanceService.get_futures_mark_prices")
+    @patch("copytrading.positions._binance_for_user")
+    @patch("copytrading.execution._binance_for_user")
+    def test_live_position_survives_one_missing_binance_snapshot(
+        self, mock_execute_client, mock_position_client, mock_marks
+    ):
+        fake = FakeLiveBinance(Decimal("521.5"))
+        mock_execute_client.return_value = (self.account, fake)
+        mock_position_client.return_value = (self.account, fake)
+        mock_marks.return_value = {"ZECUSDT": Decimal("522")}
+        self.strategy.mode = CopyStrategy.Mode.LIVE
+        self.strategy.entry_order_type = CopyStrategy.EntryOrderType.MARKET
+        self.strategy.save(update_fields=("mode", "entry_order_type"))
+        execution = process_telegram_message(
+            self.strategy, 116, CHN_SIGNAL, timezone.now()
+        )[2]
+
+        payload = get_position_payload(self.user, str(self.strategy.id))
+
+        execution.refresh_from_db()
+        self.assertEqual(execution.position_status, CopyExecution.PositionStatus.OPEN)
+        self.assertIsNotNone(execution.binance_missing_since)
+        self.assertEqual(len(payload["open"]), 1)
+        self.assertEqual(payload["open"][0]["sync_status"], "RECONNECTING")
+
+    @override_settings(
+        COPY_TRADING_LIVE_ENABLED=True,
+        COPY_TRADING_POSITION_MISSING_GRACE_SECONDS=30,
+    )
+    @patch("copytrading.positions.BinanceService.get_futures_mark_prices")
+    @patch("copytrading.positions._binance_for_user")
+    @patch("copytrading.execution._binance_for_user")
+    def test_live_position_closes_only_after_continuous_missing_grace(
+        self, mock_execute_client, mock_position_client, mock_marks
+    ):
+        fake = FakeLiveBinance(Decimal("521.5"))
+        mock_execute_client.return_value = (self.account, fake)
+        mock_position_client.return_value = (self.account, fake)
+        mock_marks.return_value = {"ZECUSDT": Decimal("522")}
+        self.strategy.mode = CopyStrategy.Mode.LIVE
+        self.strategy.entry_order_type = CopyStrategy.EntryOrderType.MARKET
+        self.strategy.save(update_fields=("mode", "entry_order_type"))
+        execution = process_telegram_message(
+            self.strategy, 117, CHN_SIGNAL, timezone.now()
+        )[2]
+        execution.binance_missing_since = timezone.now() - timedelta(seconds=31)
+        execution.save(update_fields=("binance_missing_since",))
+
+        payload = get_position_payload(self.user, str(self.strategy.id))
+
+        execution.refresh_from_db()
+        self.assertEqual(execution.position_status, CopyExecution.PositionStatus.CLOSED)
+        self.assertEqual(execution.close_reason, "BINANCE_SYNC")
+        self.assertEqual(payload["open"], [])
+
+    @override_settings(COPY_TRADING_LIVE_ENABLED=True)
+    @patch("copytrading.positions.BinanceService.get_futures_mark_prices")
+    @patch("copytrading.positions._binance_for_user")
+    @patch("copytrading.execution._binance_for_user")
+    def test_live_position_recovery_clears_missing_state_and_matches_direction(
+        self, mock_execute_client, mock_position_client, mock_marks
+    ):
+        fake = FakeLiveBinance(Decimal("521.5"))
+        mock_execute_client.return_value = (self.account, fake)
+        mock_position_client.return_value = (self.account, fake)
+        mock_marks.return_value = {"ZECUSDT": Decimal("522")}
+        self.strategy.mode = CopyStrategy.Mode.LIVE
+        self.strategy.entry_order_type = CopyStrategy.EntryOrderType.MARKET
+        self.strategy.save(update_fields=("mode", "entry_order_type"))
+        execution = process_telegram_message(
+            self.strategy, 118, CHN_SIGNAL, timezone.now()
+        )[2]
+        execution.binance_missing_since = timezone.now()
+        execution.save(update_fields=("binance_missing_since",))
+        fake.positions = [
+            {
+                "symbol": "ZECUSDT", "positionAmt": "-0.1", "markPrice": "522",
+                "entryPrice": "520", "unRealizedProfit": "-0.2", "leverage": "5",
+            },
+            {
+                "symbol": "ZECUSDT", "positionAmt": str(execution.quantity),
+                "markPrice": "522", "entryPrice": "521.5",
+                "unRealizedProfit": "0.5", "leverage": str(execution.leverage),
+            },
+        ]
+
+        payload = get_position_payload(self.user, str(self.strategy.id))
+
+        execution.refresh_from_db()
+        self.assertIsNone(execution.binance_missing_since)
+        self.assertIsNotNone(execution.last_binance_seen_at)
+        self.assertEqual(payload["open"][0]["sync_status"], "CONFIRMED")
+        self.assertEqual(payload["open"][0]["direction"], "LONG")
+        self.assertEqual(payload["open"][0]["unrealized_pnl"], "0.5")
 
     @override_settings(COPY_TRADING_LIVE_ENABLED=False)
     @patch("copytrading.execution._binance_for_user")
