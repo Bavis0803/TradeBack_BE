@@ -6,7 +6,7 @@ from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
 from .engine import StrategyCompileError, backtest, build_series, compile_strategy
-from .models import StrategyDefinition, StrategyRuntime, StrategyTrainingRun
+from .models import StrategyDefinition, StrategyPosition, StrategyRuntime, StrategyTrainingRun
 from .training import process_training_run, queue_training
 
 
@@ -203,6 +203,57 @@ class StrategyAPITests(TestCase):
         )
         response = self.client.delete(f"/strategies/executions/{runtime.id}/")
         self.assertEqual(response.status_code, 204)
+
+    def test_position_history_is_paginated_filtered_and_grouped_by_runtime(self):
+        strategy = StrategyDefinition.objects.create(
+            user=self.user, parsed_spec=compile_strategy(
+                CODE, "ta.crossover(fast, slow)", "ta.crossunder(fast, slow)"
+            ), status=StrategyDefinition.Status.TRAINED, **self.payload,
+        )
+        run = StrategyTrainingRun.objects.create(
+            strategy=strategy, status=StrategyTrainingRun.Status.COMPLETED
+        )
+        runtime = StrategyRuntime.objects.create(
+            user=self.user, strategy=strategy, training_run=run,
+            mode=StrategyRuntime.Mode.PAPER, status=StrategyRuntime.Status.ACTIVE,
+            symbols=["BTCUSDT"], timeframes=["15m"], allocation_per_order=10,
+            total_budget=100, max_daily_loss=25, leverage=2, max_open_positions=2,
+        )
+        common = {
+            "runtime": runtime, "symbol": "BTCUSDT", "timeframe": "15m",
+            "direction": "LONG", "entry_price": 100, "current_price": 101,
+            "quantity": 1, "leverage": 2, "margin_usdt": 10,
+            "stop_loss": 99, "take_profit": 102,
+        }
+        StrategyPosition.objects.create(
+            **common, signal_candle_time=1, status=StrategyPosition.Status.OPEN,
+            unrealized_pnl=Decimal("4.25"),
+        )
+        StrategyPosition.objects.create(
+            **common, signal_candle_time=2, status=StrategyPosition.Status.CLOSED,
+            realized_pnl=Decimal("-3.50"), close_reason="STOP_LOSS",
+        )
+
+        open_response = self.client.get("/strategies/positions/?status=OPEN")
+        history_response = self.client.get(
+            f"/strategies/positions/?history=1&runtime_id={runtime.id}&limit=10"
+        )
+        with self.assertNumQueries(1):
+            executions_response = self.client.get("/strategies/executions/")
+
+        self.assertEqual(open_response.status_code, 200)
+        self.assertEqual(len(open_response.data), 1)
+        self.assertEqual(history_response.status_code, 200)
+        self.assertEqual(history_response.data["count"], 1)
+        self.assertEqual(history_response.data["results"][0]["close_reason"], "STOP_LOSS")
+        self.assertEqual(executions_response.data[0]["open_positions"], 1)
+        self.assertEqual(executions_response.data[0]["closed_positions"], 1)
+        self.assertEqual(
+            Decimal(executions_response.data[0]["open_unrealized_pnl"]), Decimal("4.25")
+        )
+        self.assertEqual(
+            Decimal(executions_response.data[0]["total_realized_pnl"]), Decimal("-3.50")
+        )
 
     @override_settings(STRATEGY_LIVE_ENABLED=True)
     def test_live_requires_confirm_and_connected_binance(self):

@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from django.db.models import Q
+from django.db.models import Count, Q, Sum
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
@@ -188,7 +188,22 @@ class StrategyRuntimeListCreateAPIView(StrategyAPIView):
     def get(self, request):
         rows = StrategyRuntime.objects.filter(user=request.user).select_related(
             "strategy", "training_run"
-        ).prefetch_related("positions")
+        ).annotate(
+            open_positions_count=Count(
+                "positions", filter=Q(positions__status=StrategyPosition.Status.OPEN)
+            ),
+            closed_positions_count=Count(
+                "positions", filter=Q(positions__status=StrategyPosition.Status.CLOSED)
+            ),
+            open_unrealized_total=Sum(
+                "positions__unrealized_pnl",
+                filter=Q(positions__status=StrategyPosition.Status.OPEN),
+            ),
+            realized_total=Sum(
+                "positions__realized_pnl",
+                filter=Q(positions__status=StrategyPosition.Status.CLOSED),
+            ),
+        )
         return Response(StrategyRuntimeSerializer(rows, many=True).data)
 
     def post(self, request):
@@ -226,12 +241,44 @@ class StrategyPositionListAPIView(StrategyAPIView):
 
     def get(self, request):
         runtime_id = request.query_params.get("runtime_id")
+        requested_status = request.query_params.get("status", "").upper().strip()
+        is_history = request.query_params.get("history", "").lower() in {"1", "true", "yes"}
         rows = StrategyPosition.objects.filter(runtime__user=request.user).select_related(
             "runtime__strategy"
         )
         if runtime_id:
             rows = rows.filter(runtime_id=runtime_id)
-        return Response(StrategyPositionSerializer(rows[:200], many=True).data)
+        valid_statuses = {choice for choice, _label in StrategyPosition.Status.choices}
+        if requested_status:
+            if requested_status not in valid_statuses:
+                return Response(
+                    {"detail": "Invalid position status."}, status=status.HTTP_400_BAD_REQUEST
+                )
+            rows = rows.filter(status=requested_status)
+        elif is_history:
+            rows = rows.filter(status__in=(
+                StrategyPosition.Status.CLOSED, StrategyPosition.Status.FAILED,
+            ))
+
+        if not is_history:
+            return Response(StrategyPositionSerializer(rows[:200], many=True).data)
+
+        try:
+            limit = min(max(int(request.query_params.get("limit", 25)), 1), 100)
+            offset = max(int(request.query_params.get("offset", 0)), 0)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "limit and offset must be integers."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        total = rows.count()
+        page = rows.order_by("-closed_at", "-opened_at")[offset:offset + limit]
+        return Response({
+            "count": total,
+            "limit": limit,
+            "offset": offset,
+            "results": StrategyPositionSerializer(page, many=True).data,
+        })
 
 
 class ClosePaperStrategyPositionAPIView(StrategyAPIView):

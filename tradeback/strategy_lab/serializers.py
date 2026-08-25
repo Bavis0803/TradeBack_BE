@@ -126,6 +126,8 @@ class StrategyPositionSerializer(serializers.ModelSerializer):
 class StrategyRuntimeSerializer(serializers.ModelSerializer):
     strategy_name = serializers.CharField(source="strategy.name", read_only=True)
     open_positions = serializers.SerializerMethodField()
+    closed_positions = serializers.SerializerMethodField()
+    open_unrealized_pnl = serializers.SerializerMethodField()
     total_realized_pnl = serializers.SerializerMethodField()
     confirm_live = serializers.BooleanField(write_only=True, required=False, default=False)
 
@@ -135,17 +137,36 @@ class StrategyRuntimeSerializer(serializers.ModelSerializer):
             "id", "strategy", "strategy_name", "training_run", "mode", "status", "symbols",
             "timeframes", "allocation_per_order", "total_budget", "max_daily_loss",
             "leverage", "max_open_positions", "last_error", "open_positions",
-            "total_realized_pnl", "confirm_live", "created_at", "updated_at",
+            "closed_positions", "open_unrealized_pnl", "total_realized_pnl",
+            "confirm_live", "created_at", "updated_at",
         )
         read_only_fields = (
-            "id", "training_run", "last_error", "open_positions", "total_realized_pnl",
+            "id", "training_run", "last_error", "open_positions", "closed_positions",
+            "open_unrealized_pnl", "total_realized_pnl",
             "created_at", "updated_at",
         )
 
     def get_open_positions(self, obj):
+        if hasattr(obj, "open_positions_count"):
+            return obj.open_positions_count
         return obj.positions.filter(status=StrategyPosition.Status.OPEN).count()
 
+    def get_closed_positions(self, obj):
+        if hasattr(obj, "closed_positions_count"):
+            return obj.closed_positions_count
+        return obj.positions.filter(status=StrategyPosition.Status.CLOSED).count()
+
+    def get_open_unrealized_pnl(self, obj):
+        if hasattr(obj, "open_unrealized_total"):
+            return str(obj.open_unrealized_total or Decimal("0"))
+        return str(sum(
+            (item.unrealized_pnl for item in obj.positions.filter(status=StrategyPosition.Status.OPEN)),
+            Decimal("0"),
+        ))
+
     def get_total_realized_pnl(self, obj):
+        if hasattr(obj, "realized_total"):
+            return str(obj.realized_total or Decimal("0"))
         return str(sum(
             (item.realized_pnl for item in obj.positions.filter(status=StrategyPosition.Status.CLOSED)),
             Decimal("0"),
