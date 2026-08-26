@@ -7,7 +7,9 @@ from django.db.models import Sum
 from django.utils import timezone
 
 from exchanges.models import ExchangeAccount, TradeLog
-from exchanges.services import BinanceService, BinanceServiceError, decimal_to_string, get_bracket_for_notional
+from exchanges.services import (
+    BinanceService, BinanceServiceError, calculate_risk_sized_order, decimal_to_string,
+)
 
 from .models import CopyExecution, CopyStrategy, SignalCandidate, TelegramMessage, TradeSignal
 from .ai_detection import analyze_signal_candidate
@@ -281,21 +283,28 @@ def execute_signal(strategy, signal, paper_replay=False):
     if allocation > Decimal(str(settings.COPY_TRADING_MAX_ALLOCATION_USDT)):
         return _skip(strategy, signal, price, "Per-order allocation exceeds the server safety limit.")
 
-    binance_symbol_max = max(item["initial_leverage"] for item in brackets)
-    strategy_cap = binance_symbol_max if strategy.use_binance_max_leverage else strategy.max_leverage
-    requested = signal.requested_leverage or strategy_cap
-    leverage = min(requested, strategy_cap, 125)
     order_type = _resolve_entry_order_type(
         strategy, signal, price, accepted_low, accepted_high, paper_replay
     )
     order_price = price if order_type == CopyStrategy.EntryOrderType.MARKET else _limit_price(signal, context)
-    tentative_notional = allocation * leverage
-    leverage = min(leverage, get_bracket_for_notional(brackets, tentative_notional)["initial_leverage"])
-    notional = allocation * leverage
-    quantity = _floor_step(notional / order_price, context["volume_step"])
     take_profit = Decimal(str(signal.take_profits[0]))
-    if quantity < context["min_volume"] or order_price * quantity < context["min_notional"]:
-        return _skip(strategy, signal, price, "Allocation is below Binance minimum order size.")
+    leverage_cap = (
+        int(settings.COPY_TRADING_AUTO_LEVERAGE_CAP)
+        if strategy.use_binance_max_leverage else strategy.max_leverage
+    )
+    try:
+        sizing = calculate_risk_sized_order(
+            {
+                "direction": signal.direction, "entry_price": order_price,
+                "stop_loss": signal.stop_loss, "take_profit": take_profit,
+            },
+            allocation, context, brackets, leverage_cap=leverage_cap,
+            requested_leverage=signal.requested_leverage,
+        )
+    except ValueError as exc:
+        return _skip(strategy, signal, price, str(exc))
+    leverage = sizing["leverage"]
+    quantity = Decimal(sizing["volume"])
 
     limit_marketable = (
         signal.direction == "LONG" and price <= order_price

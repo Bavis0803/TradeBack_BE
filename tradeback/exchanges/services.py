@@ -2,7 +2,7 @@ import hashlib
 import hmac
 import json
 import time
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -438,3 +438,65 @@ def calculate_risk_reward(data, balance, context, brackets):
         "estimated_liquidation_price": decimal_to_string(max(liquidation, Decimal("0"))),
         "max_leverage_for_notional": bracket["initial_leverage"],
     }
+
+
+def calculate_risk_sized_order(
+    data, margin_budget, context, brackets, leverage_cap=20, requested_leverage=None,
+    liquidation_buffer=Decimal("1.25"),
+):
+    """Size an order so its stop-loss risk never exceeds the per-order budget."""
+    calculator_context = {
+        **context,
+        "min_volume": Decimal(context.get("min_volume") or 0),
+        "max_volume": Decimal(context.get("max_volume") or 0),
+        "volume_step": Decimal(context.get("volume_step") or 0),
+        "min_notional": Decimal(context.get("min_notional") or 0),
+    }
+    entry = Decimal(data["entry_price"])
+    stop = Decimal(data["stop_loss"])
+    target = Decimal(data["take_profit"])
+    budget = Decimal(margin_budget)
+    stop_ratio = abs(entry - stop) / entry
+    if budget <= 0 or stop_ratio <= 0:
+        raise ValueError("A positive order budget and stop-loss distance are required.")
+
+    risk_leverage_cap = max(int((Decimal("1") / stop_ratio).to_integral_value(
+        rounding=ROUND_DOWN
+    )), 1)
+    desired_cap = int(requested_leverage) if requested_leverage else int(leverage_cap)
+    leverage = max(min(desired_cap, int(leverage_cap), risk_leverage_cap, 125), 1)
+
+    # Resolve Binance notional brackets and keep liquidation beyond the stop with a buffer.
+    for _ in range(2):
+        tentative_notional = budget * leverage
+        bracket = get_bracket_for_notional(brackets, tentative_notional)
+        maintenance = Decimal(str(bracket["maint_margin_ratio"]))
+        liquidation_cap = max(int((
+            Decimal("1") / (stop_ratio * liquidation_buffer + maintenance)
+        ).to_integral_value(rounding=ROUND_DOWN)), 1)
+        leverage = max(min(
+            leverage, int(bracket["initial_leverage"]), liquidation_cap,
+        ), 1)
+
+    risk_notional_cap = budget / stop_ratio
+    notional = min(budget * leverage, risk_notional_cap)
+    step = calculator_context["volume_step"]
+    volume = notional / entry
+    if step:
+        volume = (volume / step).to_integral_value(rounding=ROUND_DOWN) * step
+    result = calculate_risk_reward(
+        {
+            "direction": data["direction"], "entry_price": entry,
+            "stop_loss": stop, "take_profit": target,
+            "volume": volume, "leverage": leverage,
+        },
+        budget, calculator_context, brackets,
+    )
+    result.update({
+        "leverage": leverage,
+        "volume": decimal_to_string(volume),
+        "risk_budget": decimal_to_string(budget),
+        "stop_distance_percent": decimal_to_string(stop_ratio * Decimal("100")),
+        "leverage_source": "SIGNAL_CAPPED" if requested_leverage else "RISK_BASED",
+    })
+    return result

@@ -353,7 +353,7 @@ class CopyExecutionTests(TestCase):
         self.assertEqual(self.strategy.messages.filter(parse_status="SIGNAL").count(), 1)
 
     @patch("copytrading.execution._binance_for_user")
-    def test_auto_leverage_uses_binance_symbol_maximum(self, mock_client):
+    def test_auto_leverage_is_risk_sized_instead_of_using_binance_maximum(self, mock_client):
         mock_client.return_value = (self.account, FakeBinance())
         self.strategy.use_binance_max_leverage = True
         self.strategy.save(update_fields=("use_binance_max_leverage",))
@@ -363,7 +363,32 @@ class CopyExecutionTests(TestCase):
         )[2]
 
         self.assertEqual(execution.status, CopyExecution.Status.PAPER_FILLED)
-        self.assertEqual(execution.leverage, 20)
+        self.assertEqual(execution.leverage, 15)
+        risk = abs(execution.entry_price - execution.stop_loss) * execution.quantity
+        self.assertLessEqual(risk, Decimal(self.strategy.allocation_usdt))
+
+    @override_settings(COPY_TRADING_AUTO_LEVERAGE_CAP=20)
+    @patch("copytrading.execution._binance_for_user")
+    def test_signal_without_leverage_never_falls_back_to_binance_maximum(self, mock_client):
+        fake = FakeBinance()
+        fake.get_leverage_brackets = lambda _symbol: [{
+            "initial_leverage": 125, "notional_floor": Decimal("0"),
+            "notional_cap": Decimal("1000000"), "maint_margin_ratio": Decimal("0.004"),
+        }]
+        mock_client.return_value = (self.account, fake)
+        self.strategy.use_binance_max_leverage = True
+        self.strategy.save(update_fields=("use_binance_max_leverage",))
+        signal_without_leverage = CHN_SIGNAL.replace("( leverage x20 )", "")
+
+        execution = process_telegram_message(
+            self.strategy, 121, signal_without_leverage, timezone.now()
+        )[2]
+
+        self.assertIsNone(execution.signal.requested_leverage)
+        self.assertLessEqual(execution.leverage, 20)
+        self.assertNotEqual(execution.leverage, 125)
+        risk = abs(execution.entry_price - execution.stop_loss) * execution.quantity
+        self.assertLessEqual(risk, Decimal(self.strategy.allocation_usdt))
 
     @patch("copytrading.execution._binance_for_user")
     def test_nearby_price_inside_configured_tolerance_is_filled(self, mock_client):

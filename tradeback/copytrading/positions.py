@@ -339,6 +339,9 @@ def _serialize(execution, mark_price, live=None):
     margin = execution.margin_usdt
     roe = pnl / margin * Decimal("100") if margin else Decimal("0")
     leverage = int(live.get("leverage")) if live else execution.leverage
+    risk_amount = abs(entry - execution.stop_loss) * quantity
+    potential_profit = abs(execution.take_profit - entry) * quantity
+    risk_reward = potential_profit / risk_amount if risk_amount else Decimal("0")
     return {
         "id": str(execution.id),
         "strategy_id": str(execution.strategy_id),
@@ -357,6 +360,9 @@ def _serialize(execution, mark_price, live=None):
         "notional_usdt": decimal_to_string(mark_price * quantity),
         "unrealized_pnl": decimal_to_string(pnl),
         "roe_percent": decimal_to_string(roe),
+        "risk_amount": decimal_to_string(risk_amount),
+        "potential_profit": decimal_to_string(potential_profit),
+        "risk_reward_ratio": decimal_to_string(risk_reward),
         "stop_loss": decimal_to_string(execution.stop_loss),
         "take_profit": decimal_to_string(execution.take_profit),
         "close_reason": execution.close_reason,

@@ -16,7 +16,7 @@ from .models import (
     TradeLog,
     TradeSyncState,
 )
-from .services import BinanceService, calculate_risk_reward
+from .services import BinanceService, calculate_risk_reward, calculate_risk_sized_order
 
 
 def symbol_context():
@@ -87,6 +87,59 @@ class CalculatorDomainTests(SimpleTestCase):
                 symbol_context(),
                 leverage_brackets(),
             )
+
+    def test_risk_sizing_derives_leverage_and_caps_loss_at_stop(self):
+        brackets = [{
+            "initial_leverage": 125, "notional_floor": Decimal("0"),
+            "notional_cap": Decimal("1000000"), "maint_margin_ratio": Decimal("0.004"),
+        }]
+        result = calculate_risk_sized_order(
+            {
+                "direction": "LONG", "entry_price": Decimal("60000"),
+                "stop_loss": Decimal("57000"), "take_profit": Decimal("66000"),
+            },
+            Decimal("5"), symbol_context(), brackets, leverage_cap=20,
+        )
+
+        self.assertEqual(result["leverage"], 15)
+        self.assertEqual(result["risk_reward_ratio"], "2")
+        self.assertLessEqual(Decimal(result["risk_amount"]), Decimal("5"))
+        self.assertLessEqual(Decimal(result["margin_required"]), Decimal("5"))
+        self.assertLess(Decimal(result["estimated_liquidation_price"]), Decimal("57000"))
+
+    def test_explicit_signal_leverage_is_still_capped_by_stop_risk(self):
+        brackets = [{
+            "initial_leverage": 125, "notional_floor": Decimal("0"),
+            "notional_cap": Decimal("1000000"), "maint_margin_ratio": Decimal("0.004"),
+        }]
+        result = calculate_risk_sized_order(
+            {
+                "direction": "LONG", "entry_price": Decimal("60000"),
+                "stop_loss": Decimal("57000"), "take_profit": Decimal("66000"),
+            },
+            Decimal("5"), symbol_context(), brackets, leverage_cap=125,
+            requested_leverage=50,
+        )
+
+        self.assertEqual(result["leverage"], 15)
+        self.assertEqual(result["leverage_source"], "SIGNAL_CAPPED")
+
+    def test_short_risk_sizing_keeps_liquidation_above_stop(self):
+        brackets = [{
+            "initial_leverage": 125, "notional_floor": Decimal("0"),
+            "notional_cap": Decimal("1000000"), "maint_margin_ratio": Decimal("0.004"),
+        }]
+        result = calculate_risk_sized_order(
+            {
+                "direction": "SHORT", "entry_price": Decimal("100"),
+                "stop_loss": Decimal("105"), "take_profit": Decimal("90"),
+            },
+            Decimal("5"), symbol_context(), brackets, leverage_cap=20,
+        )
+
+        self.assertEqual(result["risk_reward_ratio"], "2")
+        self.assertLessEqual(Decimal(result["risk_amount"]), Decimal("5"))
+        self.assertGreater(Decimal(result["estimated_liquidation_price"]), Decimal("105"))
 
 
 class RiskRewardAPITests(TestCase):
