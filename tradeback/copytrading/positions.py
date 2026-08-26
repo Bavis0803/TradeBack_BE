@@ -16,6 +16,87 @@ def _pnl(execution, price):
     return (price - execution.entry_price) * execution.quantity * multiplier
 
 
+def _position_direction(amount):
+    return "LONG" if Decimal(str(amount)) > 0 else "SHORT"
+
+
+def _live_position_map(client):
+    return {
+        (item["symbol"], _position_direction(item.get("positionAmt", "0"))): item
+        for item in client.get_futures_positions()
+        if Decimal(str(item.get("positionAmt", "0"))) != 0
+    }
+
+
+def _live_close_details(execution, client, fallback_price):
+    """Resolve an actual Binance exit from fills instead of guessing from a mark snapshot."""
+    closing_side = "SELL" if execution.direction == "LONG" else "BUY"
+    cutoff = int(execution.created_at.timestamp() * 1000) - 1000
+    try:
+        trades = client.get_futures_user_trades(execution.symbol, limit=1000)
+    except BinanceServiceError:
+        trades = []
+    remaining = execution.quantity
+    closed_quantity = Decimal("0")
+    exit_notional = Decimal("0")
+    realized = Decimal("0")
+    for trade in sorted(trades, key=lambda item: int(item.get("time") or 0)):
+        if int(trade.get("time") or 0) < cutoff or trade.get("side") != closing_side:
+            continue
+        trade_quantity = Decimal(str(trade.get("qty") or "0"))
+        if trade_quantity <= 0 or remaining <= 0:
+            continue
+        used_quantity = min(trade_quantity, remaining)
+        ratio = used_quantity / trade_quantity
+        exit_notional += Decimal(str(trade.get("price") or fallback_price)) * used_quantity
+        realized += Decimal(str(trade.get("realizedPnl") or "0")) * ratio
+        closed_quantity += used_quantity
+        remaining -= used_quantity
+    if closed_quantity:
+        exit_price = exit_notional / closed_quantity
+        target_near = abs(exit_price - execution.take_profit) / execution.take_profit <= Decimal("0.005")
+        stop_near = abs(exit_price - execution.stop_loss) / execution.stop_loss <= Decimal("0.005")
+        if execution.direction == "LONG" and (exit_price >= execution.take_profit or target_near):
+            reason = "TAKE_PROFIT"
+        elif execution.direction == "SHORT" and (exit_price <= execution.take_profit or target_near):
+            reason = "TAKE_PROFIT"
+        elif execution.direction == "LONG" and (exit_price <= execution.stop_loss or stop_near):
+            reason = "STOP_LOSS"
+        elif execution.direction == "SHORT" and (exit_price >= execution.stop_loss or stop_near):
+            reason = "STOP_LOSS"
+        else:
+            reason = "BINANCE_SYNC"
+        return exit_price, realized, reason
+    return fallback_price, _pnl(execution, fallback_price), "BINANCE_SYNC"
+
+
+@transaction.atomic
+def _finalize_live_close(execution, exit_price, realized_pnl, reason):
+    execution = CopyExecution.objects.select_for_update().get(pk=execution.pk)
+    if execution.position_status == CopyExecution.PositionStatus.CLOSED:
+        return execution
+    execution.exit_price = exit_price
+    execution.realized_pnl = realized_pnl
+    execution.position_status = CopyExecution.PositionStatus.CLOSED
+    execution.close_reason = reason
+    execution.closed_at = timezone.now()
+    execution.binance_missing_since = None
+    execution.save(update_fields=(
+        "exit_price", "realized_pnl", "position_status", "close_reason", "closed_at",
+        "binance_missing_since", "updated_at",
+    ))
+    if execution.trade_log_id:
+        execution.trade_log.realized_pnl = realized_pnl
+        execution.trade_log.save(update_fields=("realized_pnl", "updated_at"))
+    return execution
+
+
+def _close_live_from_binance(execution, client, fallback_price):
+    return _finalize_live_close(
+        execution, *_live_close_details(execution, client, fallback_price)
+    )
+
+
 @transaction.atomic
 def close_paper_position(execution, exit_price, reason):
     execution = CopyExecution.objects.select_for_update().get(pk=execution.pk)
@@ -127,6 +208,13 @@ def reconcile_pending_entries(user):
     except Exception:
         return
     terminal = {"CANCELED", "EXPIRED", "REJECTED"}
+    try:
+        live_positions = _live_position_map(client)
+    except BinanceServiceError as exc:
+        for execution in live:
+            execution.error = f"Binance position sync pending: {exc}"[:500]
+            execution.save(update_fields=("error", "updated_at"))
+        return
     for execution in live:
         try:
             order = client.get_futures_order(execution.symbol, execution.entry_order_id)
@@ -145,7 +233,18 @@ def reconcile_pending_entries(user):
                 average_price = Decimal(str(order.get("avgPrice") or "0"))
                 if average_price <= 0:
                     average_price = execution.limit_price
-                protect_live_execution(execution, client, executed_quantity, average_price)
+                live_position = live_positions.get((execution.symbol, execution.direction))
+                if live_position is None:
+                    _close_live_from_binance(execution, client, average_price)
+                    continue
+                remaining_quantity = abs(Decimal(str(live_position.get("positionAmt") or "0")))
+                if remaining_quantity <= 0:
+                    _close_live_from_binance(execution, client, average_price)
+                    continue
+                protect_live_execution(
+                    execution, client, executed_quantity, average_price,
+                    protection_quantity=min(executed_quantity, remaining_quantity),
+                )
             elif order.get("status") in terminal or expired:
                 _cancel_pending(execution)
         except BinanceServiceError as exc:
@@ -179,14 +278,7 @@ def get_position_payload(user, strategy_id=None):
     if any(item.strategy.mode == CopyStrategy.Mode.LIVE for item in open_rows):
         try:
             _, client = _binance_for_user(user)
-            live_positions = {
-                (
-                    item["symbol"],
-                    "LONG" if Decimal(str(item.get("positionAmt", "0"))) > 0 else "SHORT",
-                ): item
-                for item in client.get_futures_positions()
-                if Decimal(str(item.get("positionAmt", "0"))) != 0
-            }
+            live_positions = _live_position_map(client)
             live_sync_ok = True
         except Exception:
             live_positions = {}
@@ -218,7 +310,7 @@ def get_position_payload(user, strategy_id=None):
                     execution.binance_missing_since = now
                     execution.save(update_fields=("binance_missing_since", "updated_at"))
                 elif now - execution.binance_missing_since >= missing_grace:
-                    execution = close_paper_position(execution, mark, "BINANCE_SYNC")
+                    execution = _close_live_from_binance(execution, client, mark)
                     recent_rows.insert(0, execution)
                     continue
         if execution.strategy.mode == CopyStrategy.Mode.PAPER:

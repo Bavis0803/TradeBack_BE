@@ -114,6 +114,7 @@ class FakeLiveBinance(FakeBinance):
             "status": "NEW", "executedQty": "0", "avgPrice": "0", "orderId": 9001,
         }
         self.positions = []
+        self.user_trades = []
 
     def change_initial_leverage(self, symbol, leverage):
         return {"leverage": leverage}
@@ -135,6 +136,9 @@ class FakeLiveBinance(FakeBinance):
 
     def get_futures_positions(self):
         return self.positions
+
+    def get_futures_user_trades(self, symbol, limit=100, from_id=None):
+        return self.user_trades
 
 
 class CopyExecutionTests(TestCase):
@@ -502,11 +506,90 @@ class CopyExecutionTests(TestCase):
             "status": "FILLED", "executedQty": str(execution.quantity),
             "avgPrice": "521.5", "orderId": 9001,
         }
+        fake.positions = [{
+            "symbol": "ZECUSDT", "positionAmt": str(execution.quantity),
+            "entryPrice": "521.5", "markPrice": "522",
+            "unRealizedProfit": "0.1", "leverage": str(execution.leverage),
+        }]
         reconcile_pending_entries(self.user)
         execution.refresh_from_db()
         self.assertEqual(execution.status, CopyExecution.Status.PROTECTED)
         self.assertEqual(execution.position_status, CopyExecution.PositionStatus.OPEN)
         self.assertEqual([item["type"] for item in fake.orders[1:]], ["STOP_MARKET", "TAKE_PROFIT_MARKET"])
+
+    @override_settings(COPY_TRADING_LIVE_ENABLED=True)
+    @patch("copytrading.positions._binance_for_user")
+    @patch("copytrading.execution._binance_for_user")
+    def test_filled_live_limit_protects_only_remaining_binance_quantity(
+        self, mock_execute_client, mock_position_client
+    ):
+        fake = FakeLiveBinance()
+        mock_execute_client.return_value = (self.account, fake)
+        mock_position_client.return_value = (self.account, fake)
+        self.strategy.mode = CopyStrategy.Mode.LIVE
+        self.strategy.entry_order_type = CopyStrategy.EntryOrderType.LIMIT
+        self.strategy.save(update_fields=("mode", "entry_order_type"))
+        execution = process_telegram_message(
+            self.strategy, 119, CHN_SIGNAL, timezone.now()
+        )[2]
+        filled_quantity = execution.quantity
+        remaining_quantity = filled_quantity / Decimal("2")
+        fake.order_status = {
+            "status": "FILLED", "executedQty": str(filled_quantity),
+            "avgPrice": "521.5", "orderId": 9001,
+        }
+        fake.positions = [{
+            "symbol": "ZECUSDT", "positionAmt": str(remaining_quantity),
+            "entryPrice": "521.5", "markPrice": "522",
+            "unRealizedProfit": "0.1", "leverage": str(execution.leverage),
+        }]
+
+        reconcile_pending_entries(self.user)
+
+        execution.refresh_from_db()
+        protection_orders = fake.orders[1:]
+        self.assertEqual(execution.status, CopyExecution.Status.PROTECTED)
+        self.assertEqual(execution.quantity, filled_quantity)
+        self.assertEqual(
+            [Decimal(item["quantity"]) for item in protection_orders],
+            [remaining_quantity, remaining_quantity],
+        )
+
+    @override_settings(
+        COPY_TRADING_LIVE_ENABLED=True,
+        COPY_TRADING_POSITION_MISSING_GRACE_SECONDS=30,
+    )
+    @patch("copytrading.positions.BinanceService.get_futures_mark_prices")
+    @patch("copytrading.positions._binance_for_user")
+    @patch("copytrading.execution._binance_for_user")
+    def test_closed_live_position_uses_actual_binance_fill_and_realized_pnl(
+        self, mock_execute_client, mock_position_client, mock_marks
+    ):
+        fake = FakeLiveBinance(Decimal("521.5"))
+        mock_execute_client.return_value = (self.account, fake)
+        mock_position_client.return_value = (self.account, fake)
+        mock_marks.return_value = {"ZECUSDT": Decimal("521.5")}
+        self.strategy.mode = CopyStrategy.Mode.LIVE
+        self.strategy.entry_order_type = CopyStrategy.EntryOrderType.MARKET
+        self.strategy.save(update_fields=("mode", "entry_order_type"))
+        execution = process_telegram_message(
+            self.strategy, 120, CHN_SIGNAL, timezone.now()
+        )[2]
+        execution.binance_missing_since = timezone.now() - timedelta(seconds=31)
+        execution.save(update_fields=("binance_missing_since",))
+        fake.user_trades = [{
+            "symbol": "ZECUSDT", "side": "SELL", "price": "540",
+            "qty": str(execution.quantity), "realizedPnl": "3.75",
+            "time": int(timezone.now().timestamp() * 1000),
+        }]
+
+        payload = get_position_payload(self.user, str(self.strategy.id))
+
+        execution.refresh_from_db()
+        self.assertEqual(payload["open"], [])
+        self.assertEqual(execution.exit_price, Decimal("540"))
+        self.assertEqual(execution.realized_pnl, Decimal("3.75"))
+        self.assertEqual(execution.close_reason, "TAKE_PROFIT")
 
     @override_settings(COPY_TRADING_LIVE_ENABLED=True)
     @patch("copytrading.execution._binance_for_user")

@@ -435,7 +435,9 @@ def execute_signal(strategy, signal, paper_replay=False):
 
 
 @transaction.atomic
-def protect_live_execution(execution, client, filled_quantity, average_price):
+def protect_live_execution(
+    execution, client, filled_quantity, average_price, protection_quantity=None
+):
     """Attach reduce-only protection after a MARKET or LIMIT entry has actually filled."""
     execution = CopyExecution.objects.select_for_update().get(pk=execution.pk)
     if execution.status == CopyExecution.Status.PROTECTED:
@@ -446,17 +448,18 @@ def protect_live_execution(execution, client, filled_quantity, average_price):
     execution.entry_price = average_price
     execution.position_status = CopyExecution.PositionStatus.OPEN
     execution.status = CopyExecution.Status.SUBMITTED
+    guarded_quantity = protection_quantity or filled_quantity
     try:
         stop = client.place_futures_algo_order(
             algoType="CONDITIONAL", symbol=execution.symbol, side=closing_side,
             type="STOP_MARKET", triggerPrice=decimal_to_string(execution.stop_loss),
-            quantity=decimal_to_string(filled_quantity), reduceOnly="true", workingType="MARK_PRICE",
+            quantity=decimal_to_string(guarded_quantity), reduceOnly="true", workingType="MARK_PRICE",
         )
         execution.stop_order_id = str(stop.get("algoId", ""))
         target = client.place_futures_algo_order(
             algoType="CONDITIONAL", symbol=execution.symbol, side=closing_side,
             type="TAKE_PROFIT_MARKET", triggerPrice=decimal_to_string(execution.take_profit),
-            quantity=decimal_to_string(filled_quantity), reduceOnly="true", workingType="MARK_PRICE",
+            quantity=decimal_to_string(guarded_quantity), reduceOnly="true", workingType="MARK_PRICE",
         )
         execution.take_profit_order_id = str(target.get("algoId", ""))
         execution.status = CopyExecution.Status.PROTECTED
@@ -468,7 +471,7 @@ def protect_live_execution(execution, client, filled_quantity, average_price):
             try:
                 client.place_futures_order(
                     symbol=execution.symbol, side=closing_side, type="MARKET",
-                    quantity=decimal_to_string(filled_quantity), reduceOnly="true",
+                    quantity=decimal_to_string(guarded_quantity), reduceOnly="true",
                 )
             except BinanceServiceError:
                 execution.error = (execution.error + " Emergency close also failed; check Binance now.")[:500]
