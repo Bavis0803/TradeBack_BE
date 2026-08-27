@@ -511,7 +511,11 @@ def _serialize(execution, mark_price, live=None):
     leverage = int(live.get("leverage")) if live else execution.leverage
     active_stop_loss = entry if execution.break_even_activated_at else execution.stop_loss
     risk_amount = abs(entry - active_stop_loss) * quantity
-    potential_profit = abs(execution.take_profit - entry) * quantity
+    tp1_quantity = min(execution.take_profit_quantity or quantity, quantity)
+    runner_quantity = quantity - tp1_quantity
+    potential_profit = abs(execution.take_profit - entry) * tp1_quantity
+    if execution.runner_take_profit is not None and runner_quantity > 0:
+        potential_profit += abs(execution.runner_take_profit - entry) * runner_quantity
     risk_reward = potential_profit / risk_amount if risk_amount else Decimal("0")
     return {
         "id": str(execution.id),

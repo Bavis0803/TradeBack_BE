@@ -107,7 +107,7 @@ class CalculatorDomainTests(SimpleTestCase):
         self.assertLessEqual(Decimal(result["margin_required"]), Decimal("5"))
         self.assertLess(Decimal(result["estimated_liquidation_price"]), Decimal("57000"))
 
-    def test_explicit_signal_leverage_is_still_capped_by_stop_risk(self):
+    def test_signal_leverage_does_not_override_risk_formula(self):
         brackets = [{
             "initial_leverage": 125, "notional_floor": Decimal("0"),
             "notional_cap": Decimal("1000000"), "maint_margin_ratio": Decimal("0.004"),
@@ -122,7 +122,27 @@ class CalculatorDomainTests(SimpleTestCase):
         )
 
         self.assertEqual(result["leverage"], 15)
-        self.assertEqual(result["leverage_source"], "SIGNAL_CAPPED")
+        self.assertEqual(result["leverage_source"], "RISK_FORMULA")
+
+    def test_risk_percentage_divided_by_stop_percentage_sets_leverage(self):
+        brackets = [{
+            "initial_leverage": 125, "notional_floor": Decimal("0"),
+            "notional_cap": Decimal("1000000"), "maint_margin_ratio": Decimal("0.004"),
+        }]
+        result = calculate_risk_sized_order(
+            {
+                "direction": "LONG", "entry_price": Decimal("100"),
+                "stop_loss": Decimal("99.52"), "take_profit": Decimal("101"),
+            },
+            Decimal("5"), symbol_context(), brackets, leverage_cap=125,
+            requested_leverage=10, risk_budget=Decimal("1.5"),
+        )
+
+        # 30% allowed risk / 0.48% stop distance = 62.5, rounded down safely.
+        self.assertEqual(result["leverage"], 62)
+        self.assertEqual(result["leverage_source"], "RISK_FORMULA")
+        self.assertLessEqual(Decimal(result["risk_amount"]), Decimal("1.5"))
+        self.assertLessEqual(Decimal(result["margin_required"]), Decimal("5"))
 
     def test_short_risk_sizing_keeps_liquidation_above_stop(self):
         brackets = [{

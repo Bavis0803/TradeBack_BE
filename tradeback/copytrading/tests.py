@@ -386,7 +386,7 @@ class CopyExecutionTests(TestCase):
     @patch("copytrading.execution._binance_for_user")
     def test_signal_below_user_minimum_risk_reward_is_skipped(self, mock_client):
         mock_client.return_value = (self.account, FakeBinance())
-        self.strategy.minimum_risk_reward = Decimal("1.00")
+        self.strategy.minimum_risk_reward = Decimal("1.50")
         self.strategy.save(update_fields=("minimum_risk_reward",))
 
         execution = process_telegram_message(
@@ -394,7 +394,22 @@ class CopyExecutionTests(TestCase):
         )[2]
 
         self.assertEqual(execution.status, CopyExecution.Status.SKIPPED)
-        self.assertIn("below the configured minimum 1", execution.error)
+        self.assertIn("Full take-profit plan R:R", execution.error)
+        self.assertIn("below the configured minimum 1.5", execution.error)
+
+    @patch("copytrading.execution._binance_for_user")
+    def test_full_plan_rr_includes_tp1_partial_and_final_runner(self, mock_client):
+        mock_client.return_value = (self.account, FakeBinance())
+        # TP1 alone is about 0.76R, while 70% at TP1 + 30% at final TP is about 1.14R.
+        self.strategy.minimum_risk_reward = Decimal("1.10")
+        self.strategy.save(update_fields=("minimum_risk_reward",))
+
+        execution = process_telegram_message(
+            self.strategy, 126, CHN_SIGNAL, timezone.now()
+        )[2]
+
+        self.assertEqual(execution.status, CopyExecution.Status.PAPER_FILLED)
+        self.assertEqual(execution.runner_take_profit, Decimal("571"))
 
     @patch("copytrading.execution._binance_for_user")
     def test_risk_percent_caps_stop_loss_amount(self, mock_client):
@@ -411,9 +426,8 @@ class CopyExecutionTests(TestCase):
         allowed = Decimal(self.strategy.allocation_usdt) * Decimal("0.10")
         self.assertLessEqual(risk, allowed)
 
-    @override_settings(COPY_TRADING_AUTO_LEVERAGE_CAP=20)
     @patch("copytrading.execution._binance_for_user")
-    def test_signal_without_leverage_never_falls_back_to_binance_maximum(self, mock_client):
+    def test_auto_policy_uses_formula_then_binance_and_liquidation_caps(self, mock_client):
         fake = FakeBinance()
         fake.get_leverage_brackets = lambda _symbol: [{
             "initial_leverage": 125, "notional_floor": Decimal("0"),
@@ -429,7 +443,7 @@ class CopyExecutionTests(TestCase):
         )[2]
 
         self.assertIsNone(execution.signal.requested_leverage)
-        self.assertLessEqual(execution.leverage, 20)
+        self.assertEqual(execution.leverage, 15)
         self.assertNotEqual(execution.leverage, 125)
         risk = abs(execution.entry_price - execution.stop_loss) * execution.quantity
         self.assertLessEqual(risk, Decimal(self.strategy.allocation_usdt))

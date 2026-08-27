@@ -474,8 +474,7 @@ def calculate_risk_sized_order(
     risk_leverage_cap = max(int((allowed_risk / (budget * stop_ratio)).to_integral_value(
         rounding=ROUND_DOWN
     )), 1)
-    desired_cap = int(requested_leverage) if requested_leverage else int(leverage_cap)
-    leverage = max(min(desired_cap, int(leverage_cap), risk_leverage_cap, 125), 1)
+    leverage = max(min(int(leverage_cap), risk_leverage_cap, 125), 1)
 
     # Resolve Binance notional brackets and keep liquidation beyond the stop with a buffer.
     for _ in range(2):
@@ -508,6 +507,6 @@ def calculate_risk_sized_order(
         "volume": decimal_to_string(volume),
         "risk_budget": decimal_to_string(allowed_risk),
         "stop_distance_percent": decimal_to_string(stop_ratio * Decimal("100")),
-        "leverage_source": "SIGNAL_CAPPED" if requested_leverage else "RISK_BASED",
+        "leverage_source": "RISK_FORMULA",
     })
     return result

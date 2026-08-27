@@ -216,11 +216,11 @@ class CopyStrategyCreateSerializer(serializers.Serializer):
     allocation_usdt = serializers.DecimalField(max_digits=20, decimal_places=8, min_value=1)
     risk_percent_per_order = serializers.DecimalField(
         max_digits=5, decimal_places=2, min_value=Decimal("0.10"),
-        max_value=Decimal("100.00"), default=Decimal("20.00"),
+        max_value=Decimal("100.00"), default=Decimal("30.00"),
     )
     minimum_risk_reward = serializers.DecimalField(
         max_digits=5, decimal_places=2, min_value=Decimal("0.10"),
-        max_value=Decimal("20.00"), default=Decimal("1.00"),
+        max_value=Decimal("20.00"), default=Decimal("1.50"),
     )
     tp1_close_percent = serializers.DecimalField(
         max_digits=5, decimal_places=2, min_value=Decimal("1.00"),

@@ -58,6 +58,33 @@ def _tp1_quantity(strategy, total_quantity, entry_price, target_price, context, 
     )
 
 
+def _full_take_profit_plan(
+    signal, entry_price, stop_loss, total_quantity, tp1_quantity, tp1_close_percent,
+):
+    """Return the final runner target and weighted R:R for the executable TP plan."""
+    first_target = Decimal(str(signal.take_profits[0]))
+    runner_quantity = total_quantity - tp1_quantity
+    runner_target = None
+    if tp1_close_percent < Decimal("100") and runner_quantity > 0 and len(signal.take_profits) > 1:
+        candidate = Decimal(str(signal.take_profits[-1]))
+        valid = (
+            signal.direction == "LONG" and candidate > entry_price
+        ) or (
+            signal.direction == "SHORT" and candidate < entry_price
+        )
+        if not valid:
+            raise ValueError("The final take-profit is invalid for the signal direction.")
+        runner_target = candidate
+
+    risk_amount = abs(entry_price - stop_loss) * total_quantity
+    reward_amount = abs(first_target - entry_price) * tp1_quantity
+    if runner_target is not None:
+        reward_amount += abs(runner_target - entry_price) * runner_quantity
+    if risk_amount <= 0:
+        raise ValueError("A positive stop-loss risk is required to calculate full-plan R:R.")
+    return runner_target, reward_amount / risk_amount
+
+
 def _limit_price(signal, context):
     # Use the edge nearest the breakout so a retrace has the highest safe fill chance.
     raw = signal.entry_high if signal.direction == "LONG" else signal.entry_low
@@ -314,7 +341,7 @@ def execute_signal(strategy, signal, paper_replay=False):
     order_price = price if order_type == CopyStrategy.EntryOrderType.MARKET else _limit_price(signal, context)
     take_profit = Decimal(str(signal.take_profits[0]))
     leverage_cap = (
-        int(settings.COPY_TRADING_AUTO_LEVERAGE_CAP)
+        125
         if strategy.use_binance_max_leverage else strategy.max_leverage
     )
     try:
@@ -331,26 +358,26 @@ def execute_signal(strategy, signal, paper_replay=False):
         return _skip(strategy, signal, price, str(exc))
     leverage = sizing["leverage"]
     quantity = Decimal(sizing["volume"])
-    actual_risk_reward = Decimal(sizing["risk_reward_ratio"])
-    if actual_risk_reward < Decimal(str(strategy.minimum_risk_reward)):
-        return _skip(
-            strategy, signal, price,
-            (
-                f"Signal R:R {decimal_to_string(actual_risk_reward)} is below the configured "
-                f"minimum {decimal_to_string(strategy.minimum_risk_reward)}."
-            ),
-        )
     try:
         take_profit_quantity, tp1_close_percent = _tp1_quantity(
             strategy, quantity, order_price, take_profit, context,
         )
+        runner_take_profit, actual_risk_reward = _full_take_profit_plan(
+            signal, order_price, signal.stop_loss, quantity,
+            take_profit_quantity, tp1_close_percent,
+        )
     except ValueError as exc:
         return _skip(strategy, signal, price, str(exc))
-    runner_take_profit = (
-        Decimal(str(signal.take_profits[1]))
-        if tp1_close_percent < Decimal("100") and len(signal.take_profits) > 1
-        else None
-    )
+    if actual_risk_reward < Decimal(str(strategy.minimum_risk_reward)):
+        return _skip(
+            strategy, signal, price,
+            (
+                f"Full take-profit plan R:R {decimal_to_string(actual_risk_reward)} is below "
+                f"the configured minimum {decimal_to_string(strategy.minimum_risk_reward)} "
+                f"(TP1 closes {decimal_to_string(tp1_close_percent)}%; the runner uses the "
+                "final target)."
+            ),
+        )
 
     limit_marketable = (
         signal.direction == "LONG" and price <= order_price

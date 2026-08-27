@@ -96,13 +96,13 @@ class CopyStrategy(models.Model):
     risk_percent_per_order = models.DecimalField(
         max_digits=5,
         decimal_places=2,
-        default=Decimal("20.00"),
+        default=Decimal("30.00"),
         validators=[MinValueValidator(Decimal("0.10")), MaxValueValidator(Decimal("100.00"))],
     )
     minimum_risk_reward = models.DecimalField(
         max_digits=5,
         decimal_places=2,
-        default=Decimal("1.00"),
+        default=Decimal("1.50"),
         validators=[MinValueValidator(Decimal("0.10")), MaxValueValidator(Decimal("20.00"))],
     )
     tp1_close_percent = models.DecimalField(
