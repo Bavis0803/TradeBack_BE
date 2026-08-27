@@ -93,6 +93,18 @@ class CopyStrategy(models.Model):
     allocation_usdt = models.DecimalField(
         max_digits=20, decimal_places=8, validators=[MinValueValidator(1)]
     )
+    risk_percent_per_order = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("20.00"),
+        validators=[MinValueValidator(Decimal("0.10")), MaxValueValidator(Decimal("100.00"))],
+    )
+    minimum_risk_reward = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("1.00"),
+        validators=[MinValueValidator(Decimal("0.10")), MaxValueValidator(Decimal("20.00"))],
+    )
     max_leverage = models.PositiveSmallIntegerField(
         default=10, validators=[MinValueValidator(1), MaxValueValidator(125)]
     )

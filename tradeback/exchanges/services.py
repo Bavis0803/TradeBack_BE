@@ -442,9 +442,9 @@ def calculate_risk_reward(data, balance, context, brackets):
 
 def calculate_risk_sized_order(
     data, margin_budget, context, brackets, leverage_cap=20, requested_leverage=None,
-    liquidation_buffer=Decimal("1.25"),
+    liquidation_buffer=Decimal("1.25"), risk_budget=None,
 ):
-    """Size an order so its stop-loss risk never exceeds the per-order budget."""
+    """Size an order within both its margin budget and allowed stop-loss risk."""
     calculator_context = {
         **context,
         "min_volume": Decimal(context.get("min_volume") or 0),
@@ -456,11 +456,12 @@ def calculate_risk_sized_order(
     stop = Decimal(data["stop_loss"])
     target = Decimal(data["take_profit"])
     budget = Decimal(margin_budget)
+    allowed_risk = Decimal(risk_budget) if risk_budget is not None else budget
     stop_ratio = abs(entry - stop) / entry
-    if budget <= 0 or stop_ratio <= 0:
-        raise ValueError("A positive order budget and stop-loss distance are required.")
+    if budget <= 0 or allowed_risk <= 0 or stop_ratio <= 0:
+        raise ValueError("Positive margin, risk budget and stop-loss distance are required.")
 
-    risk_leverage_cap = max(int((Decimal("1") / stop_ratio).to_integral_value(
+    risk_leverage_cap = max(int((allowed_risk / (budget * stop_ratio)).to_integral_value(
         rounding=ROUND_DOWN
     )), 1)
     desired_cap = int(requested_leverage) if requested_leverage else int(leverage_cap)
@@ -478,7 +479,7 @@ def calculate_risk_sized_order(
             leverage, int(bracket["initial_leverage"]), liquidation_cap,
         ), 1)
 
-    risk_notional_cap = budget / stop_ratio
+    risk_notional_cap = allowed_risk / stop_ratio
     notional = min(budget * leverage, risk_notional_cap)
     step = calculator_context["volume_step"]
     volume = notional / entry
@@ -495,7 +496,7 @@ def calculate_risk_sized_order(
     result.update({
         "leverage": leverage,
         "volume": decimal_to_string(volume),
-        "risk_budget": decimal_to_string(budget),
+        "risk_budget": decimal_to_string(allowed_risk),
         "stop_distance_percent": decimal_to_string(stop_ratio * Decimal("100")),
         "leverage_source": "SIGNAL_CAPPED" if requested_leverage else "RISK_BASED",
     })

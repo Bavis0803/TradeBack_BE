@@ -158,7 +158,8 @@ class CopyExecutionTests(TestCase):
             user=self.user, telegram_connection=self.connection, chat_id=-1004446024248,
             chat_title="CHN Coin Global", chat_username="chnglobal",
             allocation_usdt="10", max_leverage=10, use_binance_max_leverage=False,
-            max_daily_loss_usdt="50",
+            max_daily_loss_usdt="50", risk_percent_per_order="100.00",
+            minimum_risk_reward="0.50",
         )
 
     def test_connection_lookup_is_async_safe_for_uncached_strategy(self):
@@ -366,6 +367,34 @@ class CopyExecutionTests(TestCase):
         self.assertEqual(execution.leverage, 15)
         risk = abs(execution.entry_price - execution.stop_loss) * execution.quantity
         self.assertLessEqual(risk, Decimal(self.strategy.allocation_usdt))
+
+    @patch("copytrading.execution._binance_for_user")
+    def test_signal_below_user_minimum_risk_reward_is_skipped(self, mock_client):
+        mock_client.return_value = (self.account, FakeBinance())
+        self.strategy.minimum_risk_reward = Decimal("1.00")
+        self.strategy.save(update_fields=("minimum_risk_reward",))
+
+        execution = process_telegram_message(
+            self.strategy, 122, CHN_SIGNAL, timezone.now()
+        )[2]
+
+        self.assertEqual(execution.status, CopyExecution.Status.SKIPPED)
+        self.assertIn("below the configured minimum 1", execution.error)
+
+    @patch("copytrading.execution._binance_for_user")
+    def test_risk_percent_caps_stop_loss_amount(self, mock_client):
+        mock_client.return_value = (self.account, FakeBinance())
+        self.strategy.risk_percent_per_order = Decimal("10.00")
+        self.strategy.save(update_fields=("risk_percent_per_order",))
+
+        execution = process_telegram_message(
+            self.strategy, 123, CHN_SIGNAL, timezone.now()
+        )[2]
+
+        self.assertEqual(execution.status, CopyExecution.Status.PAPER_FILLED)
+        risk = abs(execution.entry_price - execution.stop_loss) * execution.quantity
+        allowed = Decimal(self.strategy.allocation_usdt) * Decimal("0.10")
+        self.assertLessEqual(risk, allowed)
 
     @override_settings(COPY_TRADING_AUTO_LEVERAGE_CAP=20)
     @patch("copytrading.execution._binance_for_user")
@@ -1004,6 +1033,7 @@ class CopyTradingAPITests(TestCase):
             f"/copy-trading/strategies/{strategy.id}/",
             {
                 "allocation_usdt": "25", "max_leverage": 7,
+                "risk_percent_per_order": "12.50", "minimum_risk_reward": "1.80",
                 "max_daily_loss_usdt": "80", "entry_tolerance_percent": "0.450",
                 "status": "PAUSED",
             },
@@ -1012,6 +1042,8 @@ class CopyTradingAPITests(TestCase):
         self.assertEqual(response.status_code, 200)
         strategy.refresh_from_db()
         self.assertEqual(strategy.allocation_usdt, Decimal("25"))
+        self.assertEqual(strategy.risk_percent_per_order, Decimal("12.50"))
+        self.assertEqual(strategy.minimum_risk_reward, Decimal("1.80"))
         self.assertEqual(strategy.max_leverage, 7)
         self.assertEqual(strategy.entry_tolerance_percent, Decimal("0.450"))
         self.assertEqual(strategy.status, CopyStrategy.Status.PAUSED)

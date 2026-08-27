@@ -198,7 +198,8 @@ class CopyStrategySerializer(serializers.ModelSerializer):
         model = CopyStrategy
         fields = (
             "id", "chat_id", "chat_title", "chat_username", "mode", "status",
-            "allocation_usdt", "max_leverage", "max_daily_loss_usdt", "allowed_symbols",
+            "allocation_usdt", "risk_percent_per_order", "minimum_risk_reward",
+            "max_leverage", "max_daily_loss_usdt", "allowed_symbols",
             "use_binance_max_leverage", "entry_tolerance_percent",
             "entry_order_type", "limit_expiry_minutes",
             "ai_detection_enabled",
@@ -210,6 +211,14 @@ class CopyStrategySerializer(serializers.ModelSerializer):
 class CopyStrategyCreateSerializer(serializers.Serializer):
     chat_reference = serializers.CharField(min_length=2, max_length=255)
     allocation_usdt = serializers.DecimalField(max_digits=20, decimal_places=8, min_value=1)
+    risk_percent_per_order = serializers.DecimalField(
+        max_digits=5, decimal_places=2, min_value=Decimal("0.10"),
+        max_value=Decimal("100.00"), default=Decimal("20.00"),
+    )
+    minimum_risk_reward = serializers.DecimalField(
+        max_digits=5, decimal_places=2, min_value=Decimal("0.10"),
+        max_value=Decimal("20.00"), default=Decimal("1.00"),
+    )
     max_leverage = serializers.IntegerField(min_value=1, max_value=125, default=10)
     use_binance_max_leverage = serializers.BooleanField(default=True)
     max_daily_loss_usdt = serializers.DecimalField(max_digits=20, decimal_places=8, min_value=1, default=50)
@@ -250,7 +259,8 @@ class CopyStrategyUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = CopyStrategy
         fields = (
-            "mode", "status", "allocation_usdt", "max_leverage", "max_daily_loss_usdt",
+            "mode", "status", "allocation_usdt", "risk_percent_per_order",
+            "minimum_risk_reward", "max_leverage", "max_daily_loss_usdt",
             "allowed_symbols", "use_binance_max_leverage", "entry_tolerance_percent",
             "entry_order_type", "limit_expiry_minutes",
             "ai_detection_enabled",

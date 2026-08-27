@@ -188,6 +188,7 @@ def reprocess_saved_message(message, execute=False):
 
 def execute_signal(strategy, signal, paper_replay=False):
     allocation = Decimal(str(strategy.allocation_usdt))
+    risk_budget = allocation * Decimal(str(strategy.risk_percent_per_order)) / Decimal("100")
     daily_loss_limit = Decimal(str(strategy.max_daily_loss_usdt))
     existing = CopyExecution.objects.filter(strategy=strategy, signal=signal).first()
     if existing:
@@ -300,11 +301,21 @@ def execute_signal(strategy, signal, paper_replay=False):
             },
             allocation, context, brackets, leverage_cap=leverage_cap,
             requested_leverage=signal.requested_leverage,
+            risk_budget=risk_budget,
         )
     except ValueError as exc:
         return _skip(strategy, signal, price, str(exc))
     leverage = sizing["leverage"]
     quantity = Decimal(sizing["volume"])
+    actual_risk_reward = Decimal(sizing["risk_reward_ratio"])
+    if actual_risk_reward < Decimal(str(strategy.minimum_risk_reward)):
+        return _skip(
+            strategy, signal, price,
+            (
+                f"Signal R:R {decimal_to_string(actual_risk_reward)} is below the configured "
+                f"minimum {decimal_to_string(strategy.minimum_risk_reward)}."
+            ),
+        )
 
     limit_marketable = (
         signal.direction == "LONG" and price <= order_price

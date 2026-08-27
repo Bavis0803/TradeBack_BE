@@ -141,6 +141,24 @@ class CalculatorDomainTests(SimpleTestCase):
         self.assertLessEqual(Decimal(result["risk_amount"]), Decimal("5"))
         self.assertGreater(Decimal(result["estimated_liquidation_price"]), Decimal("105"))
 
+    def test_separate_risk_budget_limits_loss_without_exceeding_margin(self):
+        brackets = [{
+            "initial_leverage": 125, "notional_floor": Decimal("0"),
+            "notional_cap": Decimal("1000000"), "maint_margin_ratio": Decimal("0.004"),
+        }]
+        result = calculate_risk_sized_order(
+            {
+                "direction": "LONG", "entry_price": Decimal("100"),
+                "stop_loss": Decimal("95"), "take_profit": Decimal("110"),
+            },
+            Decimal("5"), symbol_context(), brackets, leverage_cap=20,
+            risk_budget=Decimal("1"),
+        )
+
+        self.assertLessEqual(Decimal(result["risk_amount"]), Decimal("1"))
+        self.assertLessEqual(Decimal(result["margin_required"]), Decimal("5"))
+        self.assertEqual(result["risk_budget"], "1")
+
 
 class RiskRewardAPITests(TestCase):
     def setUp(self):
