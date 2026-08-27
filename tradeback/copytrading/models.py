@@ -289,6 +289,10 @@ class CopyExecution(models.Model):
     entry_expires_at = models.DateTimeField(null=True, blank=True)
     stop_order_id = models.CharField(max_length=64, blank=True)
     take_profit_order_id = models.CharField(max_length=64, blank=True)
+    runner_take_profit = models.DecimalField(
+        max_digits=32, decimal_places=12, null=True, blank=True
+    )
+    runner_take_profit_order_id = models.CharField(max_length=64, blank=True)
     take_profit_quantity = models.DecimalField(max_digits=32, decimal_places=12, default=0)
     remaining_quantity = models.DecimalField(max_digits=32, decimal_places=12, default=0)
     tp1_close_percent = models.DecimalField(max_digits=5, decimal_places=2, default=100)

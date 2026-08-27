@@ -584,7 +584,10 @@ class CopyExecutionTests(TestCase):
         execution.refresh_from_db()
         self.assertEqual(execution.status, CopyExecution.Status.PROTECTED)
         self.assertEqual(execution.position_status, CopyExecution.PositionStatus.OPEN)
-        self.assertEqual([item["type"] for item in fake.orders[1:]], ["STOP_MARKET", "TAKE_PROFIT_MARKET"])
+        self.assertEqual(
+            [item["type"] for item in fake.orders[1:]],
+            ["STOP_MARKET", "TAKE_PROFIT_MARKET", "TAKE_PROFIT_MARKET"],
+        )
 
     @override_settings(COPY_TRADING_LIVE_ENABLED=True)
     @patch("copytrading.positions._binance_for_user")
@@ -624,6 +627,10 @@ class CopyExecutionTests(TestCase):
             Decimal(protection_orders[1]["quantity"]),
             execution.take_profit_quantity,
         )
+        self.assertEqual(
+            Decimal(protection_orders[2]["quantity"]),
+            remaining_quantity - execution.take_profit_quantity,
+        )
 
     @override_settings(COPY_TRADING_LIVE_ENABLED=True)
     @patch("copytrading.positions._binance_for_user")
@@ -657,6 +664,10 @@ class CopyExecutionTests(TestCase):
         execution.refresh_from_db()
         self.assertIsNotNone(execution.break_even_activated_at)
         self.assertEqual(execution.remaining_quantity, remaining)
+        self.assertEqual(execution.runner_take_profit, Decimal("571"))
+        runner_target = fake.algo_orders[execution.runner_take_profit_order_id]
+        self.assertEqual(Decimal(runner_target["quantity"]), remaining)
+        self.assertEqual(Decimal(runner_target["triggerPrice"]), Decimal("571"))
         self.assertEqual(
             fake.algo_orders[original_stop_id]["algoStatus"], "CANCELED"
         )
@@ -666,7 +677,7 @@ class CopyExecutionTests(TestCase):
 
     @patch("copytrading.positions.BinanceService.get_futures_mark_prices")
     @patch("copytrading.execution._binance_for_user")
-    def test_paper_tp1_closes_partial_then_runner_exits_at_break_even(
+    def test_paper_tp1_closes_partial_then_runner_exits_at_tp2(
         self, mock_client, mock_marks
     ):
         mock_client.return_value = (self.account, FakeBinance())
@@ -687,13 +698,13 @@ class CopyExecutionTests(TestCase):
         self.assertEqual(first["open"][0]["stop_loss"], "521.5")
         self.assertTrue(first["open"][0]["break_even_active"])
 
-        mock_marks.return_value = {execution.symbol: execution.entry_price}
+        mock_marks.return_value = {execution.symbol: execution.runner_take_profit}
         second = get_position_payload(self.user, str(self.strategy.id))
 
         execution.refresh_from_db()
         self.assertEqual(second["open"], [])
         self.assertEqual(execution.position_status, CopyExecution.PositionStatus.CLOSED)
-        self.assertEqual(execution.close_reason, "BREAK_EVEN")
+        self.assertEqual(execution.close_reason, "TAKE_PROFIT_2")
         self.assertGreater(execution.realized_pnl, 0)
 
     @override_settings(

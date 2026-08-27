@@ -346,6 +346,11 @@ def execute_signal(strategy, signal, paper_replay=False):
         )
     except ValueError as exc:
         return _skip(strategy, signal, price, str(exc))
+    runner_take_profit = (
+        Decimal(str(signal.take_profits[1]))
+        if tp1_close_percent < Decimal("100") and len(signal.take_profits) > 1
+        else None
+    )
 
     limit_marketable = (
         signal.direction == "LONG" and price <= order_price
@@ -363,6 +368,7 @@ def execute_signal(strategy, signal, paper_replay=False):
             stop_loss=signal.stop_loss, take_profit=take_profit,
             take_profit_quantity=take_profit_quantity, remaining_quantity=quantity,
             tp1_close_percent=tp1_close_percent,
+            runner_take_profit=runner_take_profit,
             entry_order_type=order_type,
         )
         trade_log = TradeLog.objects.create(
@@ -387,6 +393,7 @@ def execute_signal(strategy, signal, paper_replay=False):
             margin_usdt=allocation, stop_loss=signal.stop_loss, take_profit=take_profit,
             take_profit_quantity=take_profit_quantity, remaining_quantity=quantity,
             tp1_close_percent=tp1_close_percent,
+            runner_take_profit=runner_take_profit,
             entry_order_type=CopyStrategy.EntryOrderType.LIMIT,
             entry_expires_at=timezone.now() + timedelta(minutes=strategy.limit_expiry_minutes),
         )
@@ -409,6 +416,7 @@ def execute_signal(strategy, signal, paper_replay=False):
         stop_loss=signal.stop_loss, take_profit=take_profit,
         take_profit_quantity=take_profit_quantity, remaining_quantity=quantity,
         tp1_close_percent=tp1_close_percent,
+        runner_take_profit=runner_take_profit,
         entry_order_type=order_type,
         limit_price=order_price if order_type == CopyStrategy.EntryOrderType.LIMIT else None,
         entry_expires_at=(
@@ -470,6 +478,19 @@ def execute_signal(strategy, signal, paper_replay=False):
             workingType="MARK_PRICE",
         )
         execution.take_profit_order_id = str(target.get("algoId", ""))
+        runner_quantity = quantity - take_profit_quantity
+        if runner_take_profit is not None and runner_quantity > 0:
+            try:
+                runner_target = client.place_futures_algo_order(
+                    algoType="CONDITIONAL", symbol=signal.symbol, side=closing_side,
+                    type="TAKE_PROFIT_MARKET",
+                    triggerPrice=decimal_to_string(runner_take_profit),
+                    quantity=decimal_to_string(runner_quantity), reduceOnly="true",
+                    workingType="MARK_PRICE",
+                )
+                execution.runner_take_profit_order_id = str(runner_target.get("algoId", ""))
+            except BinanceServiceError as exc:
+                execution.error = f"TP1/SL active; runner TP2 placement pending: {exc}"[:500]
         execution.status = CopyExecution.Status.PROTECTED
     except BinanceServiceError as exc:
         execution.status = CopyExecution.Status.FAILED
@@ -519,6 +540,8 @@ def protect_live_execution(
         take_profit_quantity, tp1_close_percent = guarded_quantity, Decimal("100")
     execution.take_profit_quantity = take_profit_quantity
     execution.tp1_close_percent = tp1_close_percent
+    if tp1_close_percent >= Decimal("100"):
+        execution.runner_take_profit = None
     try:
         stop = client.place_futures_algo_order(
             algoType="CONDITIONAL", symbol=execution.symbol, side=closing_side,
@@ -533,8 +556,22 @@ def protect_live_execution(
             workingType="MARK_PRICE",
         )
         execution.take_profit_order_id = str(target.get("algoId", ""))
+        runner_quantity = guarded_quantity - take_profit_quantity
+        if execution.runner_take_profit is not None and runner_quantity > 0:
+            try:
+                runner_target = client.place_futures_algo_order(
+                    algoType="CONDITIONAL", symbol=execution.symbol, side=closing_side,
+                    type="TAKE_PROFIT_MARKET",
+                    triggerPrice=decimal_to_string(execution.runner_take_profit),
+                    quantity=decimal_to_string(runner_quantity), reduceOnly="true",
+                    workingType="MARK_PRICE",
+                )
+                execution.runner_take_profit_order_id = str(runner_target.get("algoId", ""))
+            except BinanceServiceError as exc:
+                execution.error = f"TP1/SL active; runner TP2 placement pending: {exc}"[:500]
         execution.status = CopyExecution.Status.PROTECTED
-        execution.error = ""
+        if not execution.error:
+            execution.error = ""
     except BinanceServiceError as exc:
         execution.status = CopyExecution.Status.FAILED
         execution.error = str(exc)[:500]

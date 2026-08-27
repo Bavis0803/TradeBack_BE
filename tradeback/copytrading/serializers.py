@@ -105,7 +105,7 @@ class CopyExecutionSerializer(serializers.ModelSerializer):
             "position_status", "exit_price", "realized_pnl", "close_reason", "closed_at",
             "entry_order_type", "limit_price", "entry_expires_at",
             "take_profit_quantity", "remaining_quantity", "tp1_close_percent",
-            "break_even_activated_at",
+            "runner_take_profit", "break_even_activated_at",
         )
 
 

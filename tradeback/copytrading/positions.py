@@ -126,6 +126,11 @@ def _paper_trigger(execution, mark_price):
             return execution.entry_price, "BREAK_EVEN"
         if execution.direction == "SHORT" and mark_price >= execution.entry_price:
             return execution.entry_price, "BREAK_EVEN"
+        if execution.runner_take_profit is not None:
+            if execution.direction == "LONG" and mark_price >= execution.runner_take_profit:
+                return execution.runner_take_profit, "TAKE_PROFIT_2"
+            if execution.direction == "SHORT" and mark_price <= execution.runner_take_profit:
+                return execution.runner_take_profit, "TAKE_PROFIT_2"
         return None
     if execution.direction == "LONG":
         if mark_price <= execution.stop_loss:
@@ -344,6 +349,21 @@ def _activate_live_break_even(execution, client, remaining_quantity):
         return execution
     closing_side = "SELL" if execution.direction == "LONG" else "BUY"
     old_stop_order_id = execution.stop_order_id
+    if execution.runner_take_profit is not None and not execution.runner_take_profit_order_id:
+        try:
+            runner_target = client.place_futures_algo_order(
+                algoType="CONDITIONAL", symbol=execution.symbol, side=closing_side,
+                type="TAKE_PROFIT_MARKET",
+                triggerPrice=decimal_to_string(execution.runner_take_profit),
+                quantity=decimal_to_string(remaining_quantity), reduceOnly="true",
+                workingType="MARK_PRICE",
+            )
+            execution.runner_take_profit_order_id = str(runner_target.get("algoId", ""))
+            execution.save(update_fields=("runner_take_profit_order_id", "updated_at"))
+        except BinanceServiceError as exc:
+            execution.error = f"Could not protect runner with TP2: {exc}"[:500]
+            execution.save(update_fields=("error", "updated_at"))
+            return execution
     try:
         context = client.get_symbol_context(execution.symbol, include_symbols=False)
         break_even_price = _floor_step(execution.entry_price, context.get("price_step"))
@@ -517,6 +537,10 @@ def _serialize(execution, mark_price, live=None):
         "stop_loss": decimal_to_string(active_stop_loss),
         "initial_stop_loss": decimal_to_string(execution.stop_loss),
         "take_profit": decimal_to_string(execution.take_profit),
+        "runner_take_profit": (
+            decimal_to_string(execution.runner_take_profit)
+            if execution.runner_take_profit is not None else None
+        ),
         "take_profit_quantity": decimal_to_string(execution.take_profit_quantity),
         "tp1_close_percent": decimal_to_string(execution.tp1_close_percent),
         "break_even_active": bool(execution.break_even_activated_at),
