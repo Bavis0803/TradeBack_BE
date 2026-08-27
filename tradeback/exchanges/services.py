@@ -2,7 +2,7 @@ import hashlib
 import hmac
 import json
 import time
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -471,10 +471,10 @@ def calculate_risk_sized_order(
     if budget <= 0 or allowed_risk <= 0 or stop_ratio <= 0:
         raise ValueError("Positive margin, risk budget and stop-loss distance are required.")
 
-    risk_leverage_cap = max(int((allowed_risk / (budget * stop_ratio)).to_integral_value(
-        rounding=ROUND_DOWN
+    risk_leverage = max(int((allowed_risk / (budget * stop_ratio)).to_integral_value(
+        rounding=ROUND_CEILING
     )), 1)
-    leverage = max(min(int(leverage_cap), risk_leverage_cap, 125), 1)
+    leverage = max(min(int(leverage_cap), risk_leverage, 125), 1)
 
     # Resolve Binance notional brackets and keep liquidation beyond the stop with a buffer.
     for _ in range(2):
