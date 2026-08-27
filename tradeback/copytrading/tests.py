@@ -19,7 +19,9 @@ from .models import (
 )
 from .parser import SignalParseError, parse_signal, parse_signal_candidate
 from .telegram import chat_reference_candidates, get_strategy_telegram_connection
-from .positions import get_position_payload, reconcile_pending_entries
+from .positions import (
+    get_position_payload, reconcile_live_protections, reconcile_pending_entries,
+)
 
 
 CHN_SIGNAL = """#FUTURE #ZEC LONG ( leverage x20 )
@@ -115,6 +117,7 @@ class FakeLiveBinance(FakeBinance):
         }
         self.positions = []
         self.user_trades = []
+        self.algo_orders = {}
 
     def change_initial_leverage(self, symbol, leverage):
         return {"leverage": leverage}
@@ -125,7 +128,19 @@ class FakeLiveBinance(FakeBinance):
 
     def place_futures_algo_order(self, **params):
         self.orders.append(params)
-        return {"algoId": len(self.orders) + 100}
+        algo_id = len(self.orders) + 100
+        self.algo_orders[str(algo_id)] = {
+            "algoId": algo_id, "algoStatus": "NEW", "actualQty": "0", **params,
+        }
+        return {"algoId": algo_id}
+
+    def get_futures_algo_order(self, algo_id):
+        return self.algo_orders[str(algo_id)]
+
+    def cancel_futures_algo_order(self, algo_id):
+        order = self.algo_orders[str(algo_id)]
+        order["algoStatus"] = "CANCELED"
+        return order
 
     def get_futures_order(self, symbol, order_id):
         return self.order_status
@@ -604,10 +619,82 @@ class CopyExecutionTests(TestCase):
         protection_orders = fake.orders[1:]
         self.assertEqual(execution.status, CopyExecution.Status.PROTECTED)
         self.assertEqual(execution.quantity, filled_quantity)
+        self.assertEqual(Decimal(protection_orders[0]["quantity"]), remaining_quantity)
         self.assertEqual(
-            [Decimal(item["quantity"]) for item in protection_orders],
-            [remaining_quantity, remaining_quantity],
+            Decimal(protection_orders[1]["quantity"]),
+            execution.take_profit_quantity,
         )
+
+    @override_settings(COPY_TRADING_LIVE_ENABLED=True)
+    @patch("copytrading.positions._binance_for_user")
+    @patch("copytrading.execution._binance_for_user")
+    def test_live_tp1_closes_partial_and_moves_runner_stop_to_entry(
+        self, mock_execute_client, mock_position_client
+    ):
+        fake = FakeLiveBinance(Decimal("521.5"))
+        mock_execute_client.return_value = (self.account, fake)
+        mock_position_client.return_value = (self.account, fake)
+        self.strategy.mode = CopyStrategy.Mode.LIVE
+        self.strategy.entry_order_type = CopyStrategy.EntryOrderType.MARKET
+        self.strategy.tp1_close_percent = Decimal("70")
+        self.strategy.save(update_fields=("mode", "entry_order_type", "tp1_close_percent"))
+        execution = process_telegram_message(
+            self.strategy, 124, CHN_SIGNAL, timezone.now()
+        )[2]
+        original_stop_id = execution.stop_order_id
+        target = fake.algo_orders[execution.take_profit_order_id]
+        target["algoStatus"] = "FINISHED"
+        target["actualQty"] = str(execution.take_profit_quantity)
+        remaining = execution.quantity - execution.take_profit_quantity
+        fake.positions = [{
+            "symbol": execution.symbol, "positionAmt": str(remaining),
+            "entryPrice": str(execution.entry_price), "markPrice": "540.1",
+            "unRealizedProfit": "1", "leverage": str(execution.leverage),
+        }]
+
+        reconcile_live_protections(self.user)
+
+        execution.refresh_from_db()
+        self.assertIsNotNone(execution.break_even_activated_at)
+        self.assertEqual(execution.remaining_quantity, remaining)
+        self.assertEqual(
+            fake.algo_orders[original_stop_id]["algoStatus"], "CANCELED"
+        )
+        break_even = fake.algo_orders[execution.break_even_stop_order_id]
+        self.assertEqual(Decimal(break_even["quantity"]), remaining)
+        self.assertEqual(Decimal(break_even["triggerPrice"]), execution.entry_price)
+
+    @patch("copytrading.positions.BinanceService.get_futures_mark_prices")
+    @patch("copytrading.execution._binance_for_user")
+    def test_paper_tp1_closes_partial_then_runner_exits_at_break_even(
+        self, mock_client, mock_marks
+    ):
+        mock_client.return_value = (self.account, FakeBinance())
+        execution = process_telegram_message(
+            self.strategy, 125, CHN_SIGNAL, timezone.now()
+        )[2]
+        original_quantity = execution.quantity
+        mock_marks.return_value = {execution.symbol: execution.take_profit}
+
+        first = get_position_payload(self.user, str(self.strategy.id))
+
+        execution.refresh_from_db()
+        self.assertTrue(execution.break_even_activated_at)
+        self.assertEqual(
+            execution.remaining_quantity,
+            original_quantity - execution.take_profit_quantity,
+        )
+        self.assertEqual(first["open"][0]["stop_loss"], "521.5")
+        self.assertTrue(first["open"][0]["break_even_active"])
+
+        mock_marks.return_value = {execution.symbol: execution.entry_price}
+        second = get_position_payload(self.user, str(self.strategy.id))
+
+        execution.refresh_from_db()
+        self.assertEqual(second["open"], [])
+        self.assertEqual(execution.position_status, CopyExecution.PositionStatus.CLOSED)
+        self.assertEqual(execution.close_reason, "BREAK_EVEN")
+        self.assertGreater(execution.realized_pnl, 0)
 
     @override_settings(
         COPY_TRADING_LIVE_ENABLED=True,
@@ -1034,6 +1121,7 @@ class CopyTradingAPITests(TestCase):
             {
                 "allocation_usdt": "25", "max_leverage": 7,
                 "risk_percent_per_order": "12.50", "minimum_risk_reward": "1.80",
+                "tp1_close_percent": "65.00",
                 "max_daily_loss_usdt": "80", "entry_tolerance_percent": "0.450",
                 "status": "PAUSED",
             },
@@ -1044,6 +1132,7 @@ class CopyTradingAPITests(TestCase):
         self.assertEqual(strategy.allocation_usdt, Decimal("25"))
         self.assertEqual(strategy.risk_percent_per_order, Decimal("12.50"))
         self.assertEqual(strategy.minimum_risk_reward, Decimal("1.80"))
+        self.assertEqual(strategy.tp1_close_percent, Decimal("65.00"))
         self.assertEqual(strategy.max_leverage, 7)
         self.assertEqual(strategy.entry_tolerance_percent, Decimal("0.450"))
         self.assertEqual(strategy.status, CopyStrategy.Status.PAUSED)

@@ -287,12 +287,13 @@ async def _catch_up(client, connection, on_processed=None):
 
 
 async def _reconcile_loop(client, connection, on_processed):
-    from .positions import reconcile_pending_entries
+    from .positions import reconcile_live_protections, reconcile_pending_entries
     ticks = 0
     while client.is_connected():
         await asyncio.sleep(2)
         try:
             await sync_to_async(reconcile_pending_entries, thread_sensitive=True)(connection.user)
+            await sync_to_async(reconcile_live_protections, thread_sensitive=True)(connection.user)
             ticks += 1
             if ticks % 10 == 0:
                 await _catch_up(client, connection, on_processed)

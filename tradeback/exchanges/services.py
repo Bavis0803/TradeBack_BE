@@ -351,6 +351,16 @@ class BinanceService:
             "/fapi/v1/algoOrder", params, signed=True, method="POST"
         )
 
+    def get_futures_algo_order(self, algo_id):
+        return self._request_json(
+            "/fapi/v1/algoOrder", {"algoId": algo_id}, signed=True
+        )
+
+    def cancel_futures_algo_order(self, algo_id):
+        return self._request_json(
+            "/fapi/v1/algoOrder", {"algoId": algo_id}, signed=True, method="DELETE"
+        )
+
     def get_futures_order(self, symbol, order_id):
         return self._request_json(
             "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}, signed=True

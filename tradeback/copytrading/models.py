@@ -105,6 +105,12 @@ class CopyStrategy(models.Model):
         default=Decimal("1.00"),
         validators=[MinValueValidator(Decimal("0.10")), MaxValueValidator(Decimal("20.00"))],
     )
+    tp1_close_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("70.00"),
+        validators=[MinValueValidator(Decimal("1.00")), MaxValueValidator(Decimal("100.00"))],
+    )
     max_leverage = models.PositiveSmallIntegerField(
         default=10, validators=[MinValueValidator(1), MaxValueValidator(125)]
     )
@@ -283,6 +289,11 @@ class CopyExecution(models.Model):
     entry_expires_at = models.DateTimeField(null=True, blank=True)
     stop_order_id = models.CharField(max_length=64, blank=True)
     take_profit_order_id = models.CharField(max_length=64, blank=True)
+    take_profit_quantity = models.DecimalField(max_digits=32, decimal_places=12, default=0)
+    remaining_quantity = models.DecimalField(max_digits=32, decimal_places=12, default=0)
+    tp1_close_percent = models.DecimalField(max_digits=5, decimal_places=2, default=100)
+    break_even_stop_order_id = models.CharField(max_length=64, blank=True)
+    break_even_activated_at = models.DateTimeField(null=True, blank=True)
     error = models.CharField(max_length=500, blank=True)
     position_status = models.CharField(
         max_length=8, choices=PositionStatus.choices, default=PositionStatus.NONE

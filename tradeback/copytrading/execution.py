@@ -34,6 +34,30 @@ def _floor_step(value, step):
     return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
+def _tp1_quantity(strategy, total_quantity, entry_price, target_price, context, fallback_full=False):
+    percent = Decimal(str(strategy.tp1_close_percent))
+    if percent >= Decimal("100"):
+        return total_quantity, Decimal("100")
+    step = context["volume_step"]
+    close_quantity = _floor_step(total_quantity * percent / Decimal("100"), step)
+    remaining_quantity = total_quantity - close_quantity
+    min_volume = context.get("min_volume") or Decimal("0")
+    min_notional = context.get("min_notional") or Decimal("0")
+    valid = (
+        close_quantity >= min_volume
+        and remaining_quantity >= min_volume
+        and close_quantity * target_price >= min_notional
+        and remaining_quantity * entry_price >= min_notional
+    )
+    if valid:
+        return close_quantity, percent
+    if fallback_full:
+        return total_quantity, Decimal("100")
+    raise ValueError(
+        "Position is too small to split at TP1 while preserving a valid Binance runner."
+    )
+
+
 def _limit_price(signal, context):
     # Use the edge nearest the breakout so a retrace has the highest safe fill chance.
     raw = signal.entry_high if signal.direction == "LONG" else signal.entry_low
@@ -316,6 +340,12 @@ def execute_signal(strategy, signal, paper_replay=False):
                 f"minimum {decimal_to_string(strategy.minimum_risk_reward)}."
             ),
         )
+    try:
+        take_profit_quantity, tp1_close_percent = _tp1_quantity(
+            strategy, quantity, order_price, take_profit, context,
+        )
+    except ValueError as exc:
+        return _skip(strategy, signal, price, str(exc))
 
     limit_marketable = (
         signal.direction == "LONG" and price <= order_price
@@ -331,6 +361,8 @@ def execute_signal(strategy, signal, paper_replay=False):
             symbol=signal.symbol, direction=signal.direction, entry_price=price,
             quantity=quantity, leverage=leverage, margin_usdt=allocation,
             stop_loss=signal.stop_loss, take_profit=take_profit,
+            take_profit_quantity=take_profit_quantity, remaining_quantity=quantity,
+            tp1_close_percent=tp1_close_percent,
             entry_order_type=order_type,
         )
         trade_log = TradeLog.objects.create(
@@ -353,6 +385,8 @@ def execute_signal(strategy, signal, paper_replay=False):
             symbol=signal.symbol, direction=signal.direction, entry_price=order_price,
             limit_price=order_price, quantity=quantity, leverage=leverage,
             margin_usdt=allocation, stop_loss=signal.stop_loss, take_profit=take_profit,
+            take_profit_quantity=take_profit_quantity, remaining_quantity=quantity,
+            tp1_close_percent=tp1_close_percent,
             entry_order_type=CopyStrategy.EntryOrderType.LIMIT,
             entry_expires_at=timezone.now() + timedelta(minutes=strategy.limit_expiry_minutes),
         )
@@ -373,6 +407,8 @@ def execute_signal(strategy, signal, paper_replay=False):
         symbol=signal.symbol, direction=signal.direction, entry_price=price,
         quantity=quantity, leverage=leverage, margin_usdt=allocation,
         stop_loss=signal.stop_loss, take_profit=take_profit,
+        take_profit_quantity=take_profit_quantity, remaining_quantity=quantity,
+        tp1_close_percent=tp1_close_percent,
         entry_order_type=order_type,
         limit_price=order_price if order_type == CopyStrategy.EntryOrderType.LIMIT else None,
         entry_expires_at=(
@@ -430,7 +466,8 @@ def execute_signal(strategy, signal, paper_replay=False):
         target = client.place_futures_algo_order(
             algoType="CONDITIONAL", symbol=signal.symbol, side=closing_side,
             type="TAKE_PROFIT_MARKET", triggerPrice=decimal_to_string(take_profit),
-            quantity=decimal_to_string(quantity), reduceOnly="true", workingType="MARK_PRICE",
+            quantity=decimal_to_string(take_profit_quantity), reduceOnly="true",
+            workingType="MARK_PRICE",
         )
         execution.take_profit_order_id = str(target.get("algoId", ""))
         execution.status = CopyExecution.Status.PROTECTED
@@ -464,11 +501,24 @@ def protect_live_execution(
         return execution
     side = "BUY" if execution.direction == "LONG" else "SELL"
     closing_side = "SELL" if side == "BUY" else "BUY"
+    guarded_quantity = protection_quantity or filled_quantity
     execution.quantity = filled_quantity
+    execution.remaining_quantity = guarded_quantity
     execution.entry_price = average_price
     execution.position_status = CopyExecution.PositionStatus.OPEN
     execution.status = CopyExecution.Status.SUBMITTED
-    guarded_quantity = protection_quantity or filled_quantity
+    try:
+        context = client.get_symbol_context(execution.symbol, include_symbols=False)
+        take_profit_quantity, tp1_close_percent = _tp1_quantity(
+            execution.strategy, guarded_quantity, average_price, execution.take_profit,
+            context, fallback_full=True,
+        )
+    except BinanceServiceError:
+        # The entry is already open: retain full-size TP protection if symbol metadata
+        # cannot be refreshed instead of leaving the position unprotected.
+        take_profit_quantity, tp1_close_percent = guarded_quantity, Decimal("100")
+    execution.take_profit_quantity = take_profit_quantity
+    execution.tp1_close_percent = tp1_close_percent
     try:
         stop = client.place_futures_algo_order(
             algoType="CONDITIONAL", symbol=execution.symbol, side=closing_side,
@@ -479,7 +529,8 @@ def protect_live_execution(
         target = client.place_futures_algo_order(
             algoType="CONDITIONAL", symbol=execution.symbol, side=closing_side,
             type="TAKE_PROFIT_MARKET", triggerPrice=decimal_to_string(execution.take_profit),
-            quantity=decimal_to_string(guarded_quantity), reduceOnly="true", workingType="MARK_PRICE",
+            quantity=decimal_to_string(take_profit_quantity), reduceOnly="true",
+            workingType="MARK_PRICE",
         )
         execution.take_profit_order_id = str(target.get("algoId", ""))
         execution.status = CopyExecution.Status.PROTECTED

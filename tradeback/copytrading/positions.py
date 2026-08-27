@@ -7,13 +7,14 @@ from django.utils import timezone
 
 from exchanges.services import BinanceService, BinanceServiceError, decimal_to_string
 
-from .execution import _binance_for_user, protect_live_execution
+from .execution import _binance_for_user, _floor_step, protect_live_execution
 from .models import CopyExecution, CopyStrategy
 
 
-def _pnl(execution, price):
+def _pnl(execution, price, quantity=None):
     multiplier = Decimal("1") if execution.direction == "LONG" else Decimal("-1")
-    return (price - execution.entry_price) * execution.quantity * multiplier
+    sized_quantity = quantity if quantity is not None else execution.quantity
+    return (price - execution.entry_price) * sized_quantity * multiplier
 
 
 def _position_direction(amount):
@@ -103,12 +104,15 @@ def close_paper_position(execution, exit_price, reason):
     if execution.position_status != CopyExecution.PositionStatus.OPEN:
         return execution
     execution.exit_price = exit_price
-    execution.realized_pnl = _pnl(execution, exit_price)
+    remaining = execution.remaining_quantity or execution.quantity
+    execution.realized_pnl += _pnl(execution, exit_price, remaining)
+    execution.remaining_quantity = Decimal("0")
     execution.position_status = CopyExecution.PositionStatus.CLOSED
     execution.close_reason = reason
     execution.closed_at = timezone.now()
     execution.save(update_fields=(
-        "exit_price", "realized_pnl", "position_status", "close_reason", "closed_at", "updated_at",
+        "exit_price", "realized_pnl", "remaining_quantity", "position_status",
+        "close_reason", "closed_at", "updated_at",
     ))
     if execution.trade_log_id:
         execution.trade_log.realized_pnl = execution.realized_pnl
@@ -117,17 +121,50 @@ def close_paper_position(execution, exit_price, reason):
 
 
 def _paper_trigger(execution, mark_price):
+    if execution.break_even_activated_at:
+        if execution.direction == "LONG" and mark_price <= execution.entry_price:
+            return execution.entry_price, "BREAK_EVEN"
+        if execution.direction == "SHORT" and mark_price >= execution.entry_price:
+            return execution.entry_price, "BREAK_EVEN"
+        return None
     if execution.direction == "LONG":
         if mark_price <= execution.stop_loss:
             return execution.stop_loss, "STOP_LOSS"
         if mark_price >= execution.take_profit:
-            return execution.take_profit, "TAKE_PROFIT"
+            return execution.take_profit, "TP1_PARTIAL"
     else:
         if mark_price >= execution.stop_loss:
             return execution.stop_loss, "STOP_LOSS"
         if mark_price <= execution.take_profit:
-            return execution.take_profit, "TAKE_PROFIT"
+            return execution.take_profit, "TP1_PARTIAL"
     return None
+
+
+@transaction.atomic
+def _take_paper_tp1(execution):
+    execution = CopyExecution.objects.select_for_update().get(pk=execution.pk)
+    if execution.break_even_activated_at or execution.position_status != CopyExecution.PositionStatus.OPEN:
+        return execution
+    remaining = execution.remaining_quantity or execution.quantity
+    closed_quantity = min(execution.take_profit_quantity or remaining, remaining)
+    execution.realized_pnl += _pnl(execution, execution.take_profit, closed_quantity)
+    execution.remaining_quantity = remaining - closed_quantity
+    if execution.remaining_quantity <= 0:
+        execution.exit_price = execution.take_profit
+        execution.position_status = CopyExecution.PositionStatus.CLOSED
+        execution.close_reason = "TAKE_PROFIT"
+        execution.closed_at = timezone.now()
+    else:
+        execution.break_even_activated_at = timezone.now()
+        execution.close_reason = "TP1_PARTIAL"
+    execution.save(update_fields=(
+        "realized_pnl", "remaining_quantity", "exit_price", "position_status",
+        "close_reason", "closed_at", "break_even_activated_at", "updated_at",
+    ))
+    if execution.trade_log_id:
+        execution.trade_log.realized_pnl = execution.realized_pnl
+        execution.trade_log.save(update_fields=("realized_pnl", "updated_at"))
+    return execution
 
 
 def _cancel_pending(execution, reason="LIMIT_EXPIRED"):
@@ -252,6 +289,106 @@ def reconcile_pending_entries(user):
             execution.save(update_fields=("error", "updated_at"))
 
 
+def reconcile_live_protections(user, client=None, live_positions=None):
+    """Move the runner stop to break-even only after Binance confirms TP1 filled."""
+    executions = list(
+        CopyExecution.objects.filter(
+            strategy__user=user,
+            strategy__mode=CopyStrategy.Mode.LIVE,
+            status=CopyExecution.Status.PROTECTED,
+            position_status=CopyExecution.PositionStatus.OPEN,
+            break_even_activated_at__isnull=True,
+            tp1_close_percent__lt=Decimal("100"),
+        ).exclude(take_profit_order_id="").select_related("strategy")
+    )
+    if not executions:
+        return set()
+    try:
+        if client is None:
+            _, client = _binance_for_user(user)
+        if live_positions is None:
+            live_positions = _live_position_map(client)
+    except Exception:
+        return set()
+
+    changed = set()
+    for execution in executions:
+        live = live_positions.get((execution.symbol, execution.direction))
+        if live is None:
+            continue
+        try:
+            target = client.get_futures_algo_order(execution.take_profit_order_id)
+        except BinanceServiceError as exc:
+            message = f"TP1 status sync pending: {exc}"[:500]
+            if execution.error != message:
+                execution.error = message
+                execution.save(update_fields=("error", "updated_at"))
+            continue
+        filled_quantity = Decimal(str(target.get("actualQty") or "0"))
+        if target.get("algoStatus") != "FINISHED" or filled_quantity <= 0:
+            continue
+        remaining_quantity = abs(Decimal(str(live.get("positionAmt") or "0")))
+        if remaining_quantity <= 0:
+            continue
+        _activate_live_break_even(execution, client, remaining_quantity)
+        changed.add(execution.pk)
+    return changed
+
+
+@transaction.atomic
+def _activate_live_break_even(execution, client, remaining_quantity):
+    execution = CopyExecution.objects.select_for_update().select_related("strategy").get(
+        pk=execution.pk
+    )
+    if execution.break_even_activated_at:
+        return execution
+    closing_side = "SELL" if execution.direction == "LONG" else "BUY"
+    old_stop_order_id = execution.stop_order_id
+    try:
+        context = client.get_symbol_context(execution.symbol, include_symbols=False)
+        break_even_price = _floor_step(execution.entry_price, context.get("price_step"))
+        stop = client.place_futures_algo_order(
+            algoType="CONDITIONAL", symbol=execution.symbol, side=closing_side,
+            type="STOP_MARKET", triggerPrice=decimal_to_string(break_even_price),
+            quantity=decimal_to_string(remaining_quantity), reduceOnly="true",
+            workingType="MARK_PRICE",
+        )
+    except BinanceServiceError as exc:
+        execution.error = f"Could not move SL to break-even: {exc}"[:500]
+        try:
+            client.place_futures_order(
+                symbol=execution.symbol, side=closing_side, type="MARKET",
+                quantity=decimal_to_string(remaining_quantity), reduceOnly="true",
+            )
+            execution.error = (
+                execution.error + " Runner was emergency-closed to preserve capital."
+            )[:500]
+        except BinanceServiceError:
+            execution.error = (
+                execution.error + " Original SL remains active; check Binance immediately."
+            )[:500]
+        execution.save(update_fields=("error", "updated_at"))
+        return execution
+
+    execution.break_even_stop_order_id = str(stop.get("algoId", ""))
+    execution.break_even_activated_at = timezone.now()
+    execution.remaining_quantity = remaining_quantity
+    execution.error = ""
+    execution.save(update_fields=(
+        "break_even_stop_order_id", "break_even_activated_at", "remaining_quantity",
+        "error", "updated_at",
+    ))
+    if old_stop_order_id:
+        try:
+            client.cancel_futures_algo_order(old_stop_order_id)
+        except BinanceServiceError as exc:
+            execution.error = (
+                f"Break-even SL is active, but the original SL could not be cancelled: {exc}"
+            )[:500]
+            execution.save(update_fields=("error", "updated_at"))
+    return execution
+
+
 def cancel_pending_entry(execution):
     execution.entry_expires_at = timezone.now()
     execution.save(update_fields=("entry_expires_at", "updated_at"))
@@ -280,6 +417,10 @@ def get_position_payload(user, strategy_id=None):
             _, client = _binance_for_user(user)
             live_positions = _live_position_map(client)
             live_sync_ok = True
+            changed = reconcile_live_protections(user, client, live_positions)
+            for execution in open_rows:
+                if execution.pk in changed:
+                    execution.refresh_from_db()
         except Exception:
             live_positions = {}
 
@@ -316,9 +457,15 @@ def get_position_payload(user, strategy_id=None):
         if execution.strategy.mode == CopyStrategy.Mode.PAPER:
             trigger = _paper_trigger(execution, mark)
             if trigger:
-                execution = close_paper_position(execution, *trigger)
-                recent_rows.insert(0, execution)
-                continue
+                if trigger[1] == "TP1_PARTIAL":
+                    execution = _take_paper_tp1(execution)
+                    if execution.position_status == CopyExecution.PositionStatus.CLOSED:
+                        recent_rows.insert(0, execution)
+                        continue
+                else:
+                    execution = close_paper_position(execution, *trigger)
+                    recent_rows.insert(0, execution)
+                    continue
         snapshots.append(_serialize(execution, mark, live))
 
     return {
@@ -331,15 +478,19 @@ def get_position_payload(user, strategy_id=None):
 
 def _serialize(execution, mark_price, live=None):
     entry = Decimal(str(live.get("entryPrice"))) if live else execution.entry_price
-    quantity = abs(Decimal(str(live.get("positionAmt")))) if live else execution.quantity
+    quantity = abs(Decimal(str(live.get("positionAmt")))) if live else (
+        execution.remaining_quantity or execution.quantity
+    )
     pnl = Decimal(str(live.get("unRealizedProfit", "0"))) if live else (
-        _pnl(execution, mark_price) if execution.position_status == CopyExecution.PositionStatus.OPEN
+        _pnl(execution, mark_price, quantity)
+        if execution.position_status == CopyExecution.PositionStatus.OPEN
         else execution.realized_pnl
     )
     margin = execution.margin_usdt
     roe = pnl / margin * Decimal("100") if margin else Decimal("0")
     leverage = int(live.get("leverage")) if live else execution.leverage
-    risk_amount = abs(entry - execution.stop_loss) * quantity
+    active_stop_loss = entry if execution.break_even_activated_at else execution.stop_loss
+    risk_amount = abs(entry - active_stop_loss) * quantity
     potential_profit = abs(execution.take_profit - entry) * quantity
     risk_reward = potential_profit / risk_amount if risk_amount else Decimal("0")
     return {
@@ -363,8 +514,12 @@ def _serialize(execution, mark_price, live=None):
         "risk_amount": decimal_to_string(risk_amount),
         "potential_profit": decimal_to_string(potential_profit),
         "risk_reward_ratio": decimal_to_string(risk_reward),
-        "stop_loss": decimal_to_string(execution.stop_loss),
+        "stop_loss": decimal_to_string(active_stop_loss),
+        "initial_stop_loss": decimal_to_string(execution.stop_loss),
         "take_profit": decimal_to_string(execution.take_profit),
+        "take_profit_quantity": decimal_to_string(execution.take_profit_quantity),
+        "tp1_close_percent": decimal_to_string(execution.tp1_close_percent),
+        "break_even_active": bool(execution.break_even_activated_at),
         "close_reason": execution.close_reason,
         "opened_at": execution.created_at.isoformat(),
         "closed_at": execution.closed_at.isoformat() if execution.closed_at else None,
