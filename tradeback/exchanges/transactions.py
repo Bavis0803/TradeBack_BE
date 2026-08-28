@@ -155,7 +155,10 @@ def sync_real_trades(account):
                     )
                     warnings.append(f"{market} {symbol}: {error}")
         touch_exchange_sync(account)
-        cache.delete(f"binance-dashboard:v2:{account.pk}")
+        cache.delete_many([
+            f"binance-dashboard:v3:{account.pk}",
+            f"binance-dashboard:v3:{account.pk}:stale",
+        ])
         return {"created": created, "symbols_synced": synced, "warnings": warnings}
     finally:
         cache.delete(lock_key)

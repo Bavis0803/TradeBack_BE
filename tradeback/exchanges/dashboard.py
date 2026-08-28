@@ -11,7 +11,11 @@ from .models import PortfolioSnapshot, TradeLog
 from .services import BinanceServiceError, decimal_to_string
 
 
-DASHBOARD_CACHE_SECONDS = 15
+DASHBOARD_CACHE_VERSION = "v3"
+DASHBOARD_CACHE_SECONDS = 60
+DASHBOARD_STALE_CACHE_SECONDS = 300
+DASHBOARD_BUILD_LOCK_SECONDS = 20
+RECENT_TRADE_SYNC_SECONDS = 300
 STABLE_ASSETS = {"USDT", "USDC", "FDUSD", "BUSD"}
 ASSET_NAMES = {
     "BTC": "Bitcoin",
@@ -105,23 +109,34 @@ def persist_portfolio_history(account, total_value, spot_value, futures_value, i
             running_after_day += daily_income[snapshot_date + timedelta(days=1)]
             estimates[snapshot_date] = total_value - running_after_day
 
+    # Today's point is authoritative. Historical estimates only fill gaps and must
+    # never overwrite a LIVE snapshot captured on an earlier day.
     with transaction.atomic():
-        for snapshot_date, value in estimates.items():
-            is_today = snapshot_date == today
-            PortfolioSnapshot.objects.update_or_create(
-                account=account,
-                snapshot_date=snapshot_date,
-                defaults={
-                    "total_value_usdt": max(value, Decimal("0")),
-                    "spot_value_usdt": spot_value if is_today else Decimal("0"),
-                    "futures_value_usdt": futures_value if is_today else max(value, Decimal("0")),
-                    "source": (
-                        PortfolioSnapshot.Source.LIVE
-                        if is_today
-                        else PortfolioSnapshot.Source.ESTIMATED
-                    ),
-                },
-            )
+        PortfolioSnapshot.objects.update_or_create(
+            account=account,
+            snapshot_date=today,
+            defaults={
+                "total_value_usdt": max(total_value, Decimal("0")),
+                "spot_value_usdt": spot_value,
+                "futures_value_usdt": futures_value,
+                "source": PortfolioSnapshot.Source.LIVE,
+            },
+        )
+        PortfolioSnapshot.objects.bulk_create(
+            [
+                PortfolioSnapshot(
+                    account=account,
+                    snapshot_date=snapshot_date,
+                    total_value_usdt=max(value, Decimal("0")),
+                    spot_value_usdt=Decimal("0"),
+                    futures_value_usdt=max(value, Decimal("0")),
+                    source=PortfolioSnapshot.Source.ESTIMATED,
+                )
+                for snapshot_date, value in estimates.items()
+                if snapshot_date != today
+            ],
+            ignore_conflicts=True,
+        )
 
 
 def serialize_trade(trade):
@@ -141,12 +156,40 @@ def serialize_trade(trade):
     }
 
 
+def _dashboard_cache_keys(account):
+    prefix = f"binance-dashboard:{DASHBOARD_CACHE_VERSION}:{account.pk}"
+    return prefix, f"{prefix}:stale", f"{prefix}:build-lock"
+
+
 def build_dashboard_payload(account, force_refresh=False):
-    cache_key = f"binance-dashboard:v2:{account.pk}"
+    cache_key, stale_key, lock_key = _dashboard_cache_keys(account)
     if not force_refresh:
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
+
+    owns_lock = cache.add(lock_key, "1", timeout=DASHBOARD_BUILD_LOCK_SECONDS)
+    if not owns_lock and not force_refresh:
+        stale = cache.get(stale_key)
+        if stale is not None:
+            return stale
+
+    try:
+        payload = _build_dashboard_payload(account, force_refresh=force_refresh)
+        cache.set(cache_key, payload, timeout=DASHBOARD_CACHE_SECONDS)
+        cache.set(stale_key, payload, timeout=DASHBOARD_STALE_CACHE_SECONDS)
+        return payload
+    except BinanceServiceError:
+        stale = cache.get(stale_key)
+        if stale is not None and not force_refresh:
+            return stale
+        raise
+    finally:
+        if owns_lock:
+            cache.delete(lock_key)
+
+
+def _build_dashboard_payload(account, force_refresh=False):
 
     service = build_binance_service(account)
     now = timezone.now()
@@ -234,7 +277,9 @@ def build_dashboard_payload(account, force_refresh=False):
     ]:
         if symbol and symbol not in candidate_symbols:
             candidate_symbols.append(symbol)
-    sync_recent_futures_trades(account, service, candidate_symbols)
+    trade_sync_key = f"binance-dashboard-trades:{account.pk}"
+    if force_refresh or cache.add(trade_sync_key, "1", timeout=RECENT_TRADE_SYNC_SECONDS):
+        sync_recent_futures_trades(account, service, candidate_symbols)
 
     pnl_types = {"REALIZED_PNL", "COMMISSION", "FUNDING_FEE"}
     start_24h = now - timedelta(hours=24)
@@ -257,7 +302,14 @@ def build_dashboard_payload(account, force_refresh=False):
     ]
     wins = sum(1 for value in realized if value > 0)
     win_rate = Decimal(wins * 100) / Decimal(len(realized)) if realized else Decimal("0")
-    pnl_percent = pnl_24h * Decimal("100") / total_value if total_value else Decimal("0")
+    # The card is Futures PNL, so its denominator must be estimated opening
+    # Futures equity rather than the current combined Spot + Futures portfolio.
+    opening_futures_equity = futures_value - pnl_24h
+    pnl_percent = (
+        pnl_24h * Decimal("100") / opening_futures_equity
+        if opening_futures_equity > 0
+        else Decimal("0")
+    )
 
     persist_portfolio_history(account, total_value, spot_value, futures_value, incomes)
     recent_snapshots = list(
@@ -315,5 +367,4 @@ def build_dashboard_payload(account, force_refresh=False):
         "recent_trades": recent_trades,
         "warnings": warnings,
     }
-    cache.set(cache_key, payload, timeout=DASHBOARD_CACHE_SECONDS)
     return payload

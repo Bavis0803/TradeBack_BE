@@ -9,6 +9,7 @@ from django.test import SimpleTestCase, TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
+from .dashboard import build_dashboard_payload, persist_portfolio_history
 from .models import (
     ExchangeAccount,
     ExchangeCredential,
@@ -474,6 +475,10 @@ class DashboardAPITests(TestCase):
         self.assertEqual(response.data["summary"]["total_portfolio_usdt"], "1230")
         self.assertEqual(response.data["summary"]["open_positions"], 1)
         self.assertEqual(response.data["summary"]["win_rate_30d"], "100")
+        self.assertAlmostEqual(
+            Decimal(response.data["summary"]["pnl_24h_percent"]),
+            Decimal("25") * Decimal("100") / Decimal("475"),
+        )
         self.assertEqual(response.data["recent_trades"][0]["side"], "SELL")
         self.assertEqual(PortfolioSnapshot.objects.filter(account=self.account).count(), 30)
         self.assertEqual(TradeLog.objects.filter(account=self.account).count(), 1)
@@ -485,6 +490,46 @@ class DashboardAPITests(TestCase):
         self.account.delete()
         response = self.client.get("/exchange/dashboard/")
         self.assertEqual(response.status_code, 409)
+
+    def test_estimated_history_never_overwrites_a_live_daily_snapshot(self):
+        yesterday = timezone.localdate() - timedelta(days=1)
+        PortfolioSnapshot.objects.create(
+            account=self.account,
+            snapshot_date=yesterday,
+            total_value_usdt=Decimal("50"),
+            spot_value_usdt=Decimal("10"),
+            futures_value_usdt=Decimal("40"),
+            source=PortfolioSnapshot.Source.LIVE,
+        )
+
+        persist_portfolio_history(
+            self.account,
+            total_value=Decimal("60"),
+            spot_value=Decimal("10"),
+            futures_value=Decimal("50"),
+            incomes=[{
+                "time": int(timezone.now().timestamp() * 1000),
+                "income": "10",
+            }],
+        )
+
+        snapshot = PortfolioSnapshot.objects.get(
+            account=self.account, snapshot_date=yesterday
+        )
+        self.assertEqual(snapshot.source, PortfolioSnapshot.Source.LIVE)
+        self.assertEqual(snapshot.total_value_usdt, Decimal("50"))
+
+    @patch("exchanges.dashboard._build_dashboard_payload")
+    def test_concurrent_dashboard_request_uses_stale_redis_snapshot(self, mock_build):
+        prefix = f"binance-dashboard:v3:{self.account.pk}"
+        stale = {"as_of": "cached", "summary": {"total_portfolio_usdt": "50"}}
+        cache.set(f"{prefix}:stale", stale, timeout=300)
+        cache.set(f"{prefix}:build-lock", "1", timeout=20)
+
+        result = build_dashboard_payload(self.account)
+
+        self.assertEqual(result, stale)
+        mock_build.assert_not_called()
 
 
 class TransactionLogAPITests(TestCase):
