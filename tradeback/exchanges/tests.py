@@ -519,6 +519,34 @@ class DashboardAPITests(TestCase):
         self.assertEqual(snapshot.source, PortfolioSnapshot.Source.LIVE)
         self.assertEqual(snapshot.total_value_usdt, Decimal("50"))
 
+    def test_estimated_performance_excludes_transfers_and_refreshes_old_estimates(self):
+        yesterday = timezone.localdate() - timedelta(days=1)
+        PortfolioSnapshot.objects.create(
+            account=self.account,
+            snapshot_date=yesterday,
+            total_value_usdt=Decimal("0.001"),
+            futures_value_usdt=Decimal("0.001"),
+            source=PortfolioSnapshot.Source.ESTIMATED,
+        )
+        now_ms = int(timezone.now().timestamp() * 1000)
+
+        persist_portfolio_history(
+            self.account,
+            total_value=Decimal("60"),
+            spot_value=Decimal("0"),
+            futures_value=Decimal("60"),
+            incomes=[
+                {"time": now_ms, "incomeType": "TRANSFER", "income": "100"},
+                {"time": now_ms, "incomeType": "REALIZED_PNL", "income": "-5"},
+            ],
+        )
+
+        snapshot = PortfolioSnapshot.objects.get(
+            account=self.account, snapshot_date=yesterday
+        )
+        self.assertEqual(snapshot.source, PortfolioSnapshot.Source.ESTIMATED)
+        self.assertEqual(snapshot.total_value_usdt, Decimal("65"))
+
     @patch("exchanges.dashboard._build_dashboard_payload")
     def test_concurrent_dashboard_request_uses_stale_redis_snapshot(self, mock_build):
         prefix = f"binance-dashboard:v3:{self.account.pk}"

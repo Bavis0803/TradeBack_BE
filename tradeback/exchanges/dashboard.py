@@ -16,6 +16,7 @@ DASHBOARD_CACHE_SECONDS = 60
 DASHBOARD_STALE_CACHE_SECONDS = 300
 DASHBOARD_BUILD_LOCK_SECONDS = 20
 RECENT_TRADE_SYNC_SECONDS = 300
+PNL_INCOME_TYPES = {"REALIZED_PNL", "COMMISSION", "FUNDING_FEE"}
 STABLE_ASSETS = {"USDT", "USDC", "FDUSD", "BUSD"}
 ASSET_NAMES = {
     "BTC": "Bitcoin",
@@ -96,6 +97,8 @@ def persist_portfolio_history(account, total_value, spot_value, futures_value, i
     today = timezone.localdate()
     daily_income = defaultdict(lambda: Decimal("0"))
     for item in incomes:
+        if item.get("incomeType") not in PNL_INCOME_TYPES:
+            continue
         income_date = as_utc_datetime(item["time"]).date()
         daily_income[income_date] += as_decimal(item.get("income"))
 
@@ -122,20 +125,40 @@ def persist_portfolio_history(account, total_value, spot_value, futures_value, i
                 "source": PortfolioSnapshot.Source.LIVE,
             },
         )
-        PortfolioSnapshot.objects.bulk_create(
-            [
-                PortfolioSnapshot(
+        historical_estimates = {
+            snapshot_date: max(value, Decimal("0"))
+            for snapshot_date, value in estimates.items()
+            if snapshot_date != today
+        }
+        existing = {
+            item.snapshot_date: item
+            for item in PortfolioSnapshot.objects.filter(
+                account=account,
+                snapshot_date__in=historical_estimates,
+            )
+        }
+        to_create = []
+        to_update = []
+        for snapshot_date, value in historical_estimates.items():
+            snapshot = existing.get(snapshot_date)
+            if snapshot is None:
+                to_create.append(PortfolioSnapshot(
                     account=account,
                     snapshot_date=snapshot_date,
-                    total_value_usdt=max(value, Decimal("0")),
+                    total_value_usdt=value,
                     spot_value_usdt=Decimal("0"),
-                    futures_value_usdt=max(value, Decimal("0")),
+                    futures_value_usdt=value,
                     source=PortfolioSnapshot.Source.ESTIMATED,
-                )
-                for snapshot_date, value in estimates.items()
-                if snapshot_date != today
-            ],
-            ignore_conflicts=True,
+                ))
+            elif snapshot.source == PortfolioSnapshot.Source.ESTIMATED:
+                snapshot.total_value_usdt = value
+                snapshot.spot_value_usdt = Decimal("0")
+                snapshot.futures_value_usdt = value
+                to_update.append(snapshot)
+        PortfolioSnapshot.objects.bulk_create(to_create, ignore_conflicts=True)
+        PortfolioSnapshot.objects.bulk_update(
+            to_update,
+            ("total_value_usdt", "spot_value_usdt", "futures_value_usdt"),
         )
 
 
@@ -281,18 +304,17 @@ def _build_dashboard_payload(account, force_refresh=False):
     if force_refresh or cache.add(trade_sync_key, "1", timeout=RECENT_TRADE_SYNC_SECONDS):
         sync_recent_futures_trades(account, service, candidate_symbols)
 
-    pnl_types = {"REALIZED_PNL", "COMMISSION", "FUNDING_FEE"}
     start_24h = now - timedelta(hours=24)
     pnl_24h = sum(
         as_decimal(item.get("income"))
         for item in incomes
-        if item.get("incomeType") in pnl_types
+        if item.get("incomeType") in PNL_INCOME_TYPES
         and as_utc_datetime(item["time"]) >= start_24h
     )
     pnl_30d = sum(
         as_decimal(item.get("income"))
         for item in incomes
-        if item.get("incomeType") in pnl_types
+        if item.get("incomeType") in PNL_INCOME_TYPES
     )
     realized = [
         as_decimal(item.get("income"))
