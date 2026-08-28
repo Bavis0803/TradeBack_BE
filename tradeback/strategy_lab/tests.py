@@ -6,6 +6,7 @@ from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
 from .engine import StrategyCompileError, backtest, build_series, compile_strategy
+from .execution import _open_position
 from .models import StrategyDefinition, StrategyPosition, StrategyRuntime, StrategyTrainingRun
 from .training import process_training_run, queue_training
 
@@ -163,6 +164,16 @@ class StrategyAPITests(TestCase):
             "max_daily_loss": "25", "leverage": 2, "max_open_positions": 2,
         }, format="json")
         self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(Decimal(response.data["risk_percent_per_order"]), Decimal("30"))
+        self.assertEqual(Decimal(response.data["minimum_risk_reward"]), Decimal("1.5"))
+        self.assertTrue(response.data["use_binance_max_leverage"])
+
+        invalid = self.client.patch(
+            f"/strategies/executions/{response.data['id']}/",
+            {"minimum_risk_reward": "2.1"}, format="json",
+        )
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn("minimum_risk_reward", invalid.data)
 
     def test_active_execution_protects_strategy_edit_and_delete(self):
         strategy = StrategyDefinition.objects.create(
@@ -277,3 +288,80 @@ class StrategyAPITests(TestCase):
         response = self.client.post("/strategies/executions/", data, format="json")
         self.assertEqual(response.status_code, 400)
         self.assertIn("mode", response.data)
+
+
+class StrategyRiskSizingTests(TestCase):
+    class MarketClient:
+        def get_symbol_context(self, symbol, include_symbols=False):
+            return {
+                "symbol": symbol, "current_price": Decimal("0.784"),
+                "min_volume": Decimal("0.1"), "max_volume": Decimal("10000000"),
+                "volume_step": Decimal("0.1"), "min_notional": Decimal("5"),
+            }
+
+        def get_usdt_balance(self):
+            return Decimal("500")
+
+        def get_leverage_brackets(self, symbol):
+            return [{
+                "initial_leverage": 125, "notional_floor": Decimal("0"),
+                "notional_cap": Decimal("50000"),
+                "maint_margin_ratio": Decimal("0.004"),
+            }]
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="risk-sized-strategy", password="secret-pass"
+        )
+        self.strategy = StrategyDefinition.objects.create(
+            user=self.user, name="SUI risk sizing", indicator_code=CODE,
+            long_condition="ta.crossover(fast, slow)",
+            short_condition="ta.crossunder(fast, slow)",
+            risk_reward_ratio=Decimal("1.90"), stop_loss_percent=Decimal("1"),
+            symbols=["SUIUSDT"], timeframes=["15m"], history_days=30,
+            parsed_spec=compile_strategy(
+                CODE, "ta.crossover(fast, slow)", "ta.crossunder(fast, slow)"
+            ), status=StrategyDefinition.Status.TRAINED,
+        )
+        self.run = StrategyTrainingRun.objects.create(
+            strategy=self.strategy, status=StrategyTrainingRun.Status.COMPLETED
+        )
+
+    def runtime(self, **overrides):
+        values = {
+            "user": self.user, "strategy": self.strategy, "training_run": self.run,
+            "mode": StrategyRuntime.Mode.PAPER, "status": StrategyRuntime.Status.ACTIVE,
+            "symbols": ["SUIUSDT"], "timeframes": ["15m"],
+            "allocation_per_order": Decimal("5"), "total_budget": Decimal("100"),
+            "max_daily_loss": Decimal("30"), "risk_percent_per_order": Decimal("30"),
+            "minimum_risk_reward": Decimal("1.5"), "use_binance_max_leverage": True,
+            "leverage": 10, "max_open_positions": 3,
+        }
+        values.update(overrides)
+        return StrategyRuntime.objects.create(**values)
+
+    def test_paper_entry_uses_copy_trade_risk_formula(self):
+        position = _open_position(
+            self.runtime(), "SUIUSDT", "15m", 123, "LONG", Decimal("0.784"),
+            client=self.MarketClient(), signal_stop=Decimal("0.744"),
+        )
+
+        self.assertEqual(position.leverage, 6)
+        self.assertEqual(position.quantity, Decimal("37.5"))
+        self.assertEqual(position.margin_usdt, Decimal("5"))
+        self.assertEqual(position.stop_loss, Decimal("0.744"))
+        self.assertEqual(position.take_profit, Decimal("0.860"))
+        self.assertLessEqual(
+            (position.entry_price - position.stop_loss) * position.quantity,
+            Decimal("1.5"),
+        )
+
+    def test_manual_policy_caps_risk_sized_leverage(self):
+        position = _open_position(
+            self.runtime(use_binance_max_leverage=False, leverage=3),
+            "SUIUSDT", "15m", 124, "LONG", Decimal("0.784"),
+            client=self.MarketClient(), signal_stop=Decimal("0.744"),
+        )
+
+        self.assertEqual(position.leverage, 3)
+        self.assertEqual(position.quantity, Decimal("19.1"))

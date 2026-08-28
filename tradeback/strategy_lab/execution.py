@@ -1,5 +1,5 @@
 from datetime import timedelta
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal
 
 from django.conf import settings
 from django.db import transaction
@@ -8,7 +8,9 @@ from django.utils import timezone
 
 from exchanges.connection import build_binance_service, get_binance_account
 from exchanges.models import ExchangeAccount, TradeLog
-from exchanges.services import BinanceService, BinanceServiceError, get_bracket_for_notional
+from exchanges.services import (
+    BinanceService, BinanceServiceError, calculate_risk_sized_order, decimal_to_string,
+)
 
 from .engine import build_series, evaluate_condition, parse_klines
 from .models import StrategyPosition, StrategyRuntime
@@ -18,10 +20,6 @@ TIMEFRAME_MILLISECONDS = {
     "5m": 5 * 60_000, "15m": 15 * 60_000, "1h": 60 * 60_000,
     "4h": 4 * 60 * 60_000, "1d": 24 * 60 * 60_000,
 }
-
-
-def _floor_step(value, step):
-    return (value / step).to_integral_value(rounding=ROUND_DOWN) * step if step else value
 
 
 def _pnl(position, price):
@@ -145,22 +143,17 @@ def _open_position(
 
     market = client or BinanceService()
     context = market.get_symbol_context(symbol, include_symbols=False)
-    leverage = runtime.leverage
+    brackets = [{
+        "initial_leverage": 125,
+        "notional_floor": Decimal("0"),
+        "notional_cap": Decimal("1E50"),
+        "maint_margin_ratio": Decimal("0.004"),
+    }]
     if client:
         balance = client.get_usdt_balance()
         if runtime.allocation_per_order > balance:
             raise BinanceServiceError("Strategy allocation exceeds available Futures balance.")
         brackets = client.get_leverage_brackets(symbol)
-        leverage = min(
-            leverage,
-            get_bracket_for_notional(brackets, runtime.allocation_per_order * leverage)["initial_leverage"],
-        )
-    quantity = _floor_step(
-        runtime.allocation_per_order * leverage / price,
-        context["volume_step"],
-    )
-    if quantity < context["min_volume"] or quantity * price < context["min_notional"]:
-        raise BinanceServiceError("Strategy allocation is below Binance minimum order size.")
     stop = Decimal(str(signal_stop)) if signal_stop is not None else None
     valid_signal_stop = stop is not None and (
         (direction == "LONG" and stop < price) or (direction == "SHORT" and stop > price)
@@ -171,6 +164,31 @@ def _open_position(
         price + risk * strategy.risk_reward_ratio
         if direction == "LONG" else price - risk * strategy.risk_reward_ratio
     )
+    risk_budget = (
+        runtime.allocation_per_order * runtime.risk_percent_per_order / Decimal("100")
+    )
+    leverage_cap = 125 if runtime.use_binance_max_leverage else runtime.leverage
+    try:
+        sizing = calculate_risk_sized_order(
+            {
+                "direction": direction,
+                "entry_price": price,
+                "stop_loss": stop,
+                "take_profit": target,
+            },
+            runtime.allocation_per_order,
+            context,
+            brackets,
+            leverage_cap=leverage_cap,
+            risk_budget=risk_budget,
+        )
+    except ValueError as exc:
+        raise BinanceServiceError(str(exc)) from exc
+    actual_rr = Decimal(sizing["risk_reward_ratio"])
+    if actual_rr < runtime.minimum_risk_reward:
+        return None
+    leverage = sizing["leverage"]
+    quantity = Decimal(sizing["volume"])
     position = StrategyPosition.objects.create(
         runtime=runtime, symbol=symbol, timeframe=timeframe, direction=direction,
         entry_price=price, current_price=price, quantity=quantity, leverage=leverage,
@@ -189,7 +207,7 @@ def _open_position(
     try:
         client.change_initial_leverage(symbol, leverage)
         entry = client.place_futures_order(
-            symbol=symbol, side=side, type="MARKET", quantity=str(quantity),
+            symbol=symbol, side=side, type="MARKET", quantity=decimal_to_string(quantity),
             newOrderRespType="RESULT", newClientOrderId=f"st-{position.id.hex[:28]}",
         )
         position.entry_order_id = str(entry.get("orderId", ""))
@@ -208,11 +226,11 @@ def _open_position(
             position.margin_usdt = quantity * fill_price / leverage
         position.stop_order_id = str(client.place_futures_algo_order(
             symbol=symbol, side=close_side, type="STOP_MARKET", triggerPrice=str(stop),
-            closePosition="true", workingType="MARK_PRICE",
+            quantity=decimal_to_string(quantity), reduceOnly="true", workingType="MARK_PRICE",
         ).get("algoId", ""))
         position.take_profit_order_id = str(client.place_futures_algo_order(
             symbol=symbol, side=close_side, type="TAKE_PROFIT_MARKET", triggerPrice=str(target),
-            closePosition="true", workingType="MARK_PRICE",
+            quantity=decimal_to_string(quantity), reduceOnly="true", workingType="MARK_PRICE",
         ).get("algoId", ""))
         position.save(update_fields=(
             "entry_price", "current_price", "margin_usdt", "stop_loss", "take_profit",
@@ -222,7 +240,8 @@ def _open_position(
         try:
             if position.entry_order_id:
                 client.place_futures_order(
-                    symbol=symbol, side=close_side, type="MARKET", quantity=str(quantity),
+                    symbol=symbol, side=close_side, type="MARKET",
+                    quantity=decimal_to_string(quantity),
                     reduceOnly="true",
                 )
         except Exception:

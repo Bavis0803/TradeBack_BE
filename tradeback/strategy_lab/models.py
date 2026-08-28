@@ -141,6 +141,15 @@ class StrategyRuntime(models.Model):
     max_daily_loss = models.DecimalField(
         max_digits=20, decimal_places=8, validators=[MinValueValidator(Decimal("1"))]
     )
+    risk_percent_per_order = models.DecimalField(
+        max_digits=5, decimal_places=2, default=Decimal("30.00"),
+        validators=[MinValueValidator(Decimal("0.10")), MaxValueValidator(Decimal("100.00"))],
+    )
+    minimum_risk_reward = models.DecimalField(
+        max_digits=5, decimal_places=2, default=Decimal("1.50"),
+        validators=[MinValueValidator(Decimal("0.10")), MaxValueValidator(Decimal("20.00"))],
+    )
+    use_binance_max_leverage = models.BooleanField(default=True)
     leverage = models.PositiveSmallIntegerField(
         default=1, validators=[MinValueValidator(1), MaxValueValidator(125)]
     )

@@ -136,6 +136,7 @@ class StrategyRuntimeSerializer(serializers.ModelSerializer):
         fields = (
             "id", "strategy", "strategy_name", "training_run", "mode", "status", "symbols",
             "timeframes", "allocation_per_order", "total_budget", "max_daily_loss",
+            "risk_percent_per_order", "minimum_risk_reward", "use_binance_max_leverage",
             "leverage", "max_open_positions", "last_error", "open_positions",
             "closed_positions", "open_unrealized_pnl", "total_realized_pnl",
             "confirm_live", "created_at", "updated_at",
@@ -193,6 +194,16 @@ class StrategyRuntimeSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"total_budget": "Budget must cover at least one order."})
         if budget > Decimal(str(settings.STRATEGY_MAX_BUDGET_USDT)):
             raise serializers.ValidationError({"total_budget": "Budget exceeds the server safety limit."})
+        minimum_rr = attrs.get(
+            "minimum_risk_reward", getattr(self.instance, "minimum_risk_reward", Decimal("1.50"))
+        )
+        if strategy and minimum_rr > strategy.risk_reward_ratio:
+            raise serializers.ValidationError({
+                "minimum_risk_reward": (
+                    f"This strategy targets {strategy.risk_reward_ratio}R; the execution "
+                    f"minimum cannot exceed its trained target."
+                )
+            })
         mode = attrs.get("mode", getattr(self.instance, "mode", StrategyRuntime.Mode.PAPER))
         live_transition = (
             mode == StrategyRuntime.Mode.LIVE
