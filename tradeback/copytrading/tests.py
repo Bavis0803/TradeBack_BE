@@ -44,6 +44,24 @@ Entry: 0.2882
 Target: 0.2682 - 0.2476
 SL: 0.3084 (7%)"""
 
+BTC_SHORTHAND_SIGNAL = """#FUTURE #BTC
+SHORT ( leverage x20 )
+Entry: 79.400
+Target: 78.000 - 76.800
+SL: 81.170 (2.2%)"""
+
+BCH_SMALL_SPLIT_SIGNAL = """#FUTURE #BCH
+SHORT ( leverage x10 )
+Entry: 255
+Target: 246 - 237
+SL: 264 (3.5%)"""
+
+XAUT_LOW_WEIGHTED_RR_SIGNAL = """#FUTURE #XAUTUSDT
+SHORT ( leverage x50 )
+Entry: 4543.7
+Target: 4500 - 4420
+SL: 4610 (1.4%)"""
+
 
 class SignalParserTests(SimpleTestCase):
     def test_parses_real_chn_signal_format(self):
@@ -154,6 +172,26 @@ class FakeLiveBinance(FakeBinance):
 
     def get_futures_user_trades(self, symbol, limit=100, from_id=None):
         return self.user_trades
+
+
+class ContractFakeBinance(FakeBinance):
+    def __init__(self, current_price, min_notional, price_step):
+        super().__init__(current_price)
+        self.min_notional = Decimal(str(min_notional))
+        self.price_step = Decimal(str(price_step))
+
+    def get_symbol_context(self, symbol, include_symbols=False):
+        return {
+            "current_price": self.current_price, "volume_step": Decimal("0.001"),
+            "min_volume": Decimal("0.001"), "min_notional": self.min_notional,
+            "price_step": self.price_step,
+        }
+
+    def get_leverage_brackets(self, symbol):
+        return [{
+            "initial_leverage": 125, "notional_floor": Decimal("0"),
+            "notional_cap": Decimal("1000000"), "maint_margin_ratio": Decimal("0.004"),
+        }]
 
 
 class CopyExecutionTests(TestCase):
@@ -384,7 +422,7 @@ class CopyExecutionTests(TestCase):
         self.assertLessEqual(risk, Decimal(self.strategy.allocation_usdt))
 
     @patch("copytrading.execution._binance_for_user")
-    def test_signal_below_user_minimum_risk_reward_is_skipped(self, mock_client):
+    def test_low_weighted_rr_falls_back_to_full_final_target(self, mock_client):
         mock_client.return_value = (self.account, FakeBinance())
         self.strategy.minimum_risk_reward = Decimal("1.50")
         self.strategy.save(update_fields=("minimum_risk_reward",))
@@ -393,9 +431,83 @@ class CopyExecutionTests(TestCase):
             self.strategy, 122, CHN_SIGNAL, timezone.now()
         )[2]
 
-        self.assertEqual(execution.status, CopyExecution.Status.SKIPPED)
-        self.assertIn("Full take-profit plan R:R", execution.error)
-        self.assertIn("below the configured minimum 1.5", execution.error)
+        self.assertEqual(execution.status, CopyExecution.Status.PAPER_FILLED)
+        self.assertEqual(execution.take_profit, Decimal("571"))
+        self.assertEqual(execution.tp1_close_percent, Decimal("100"))
+        self.assertIsNone(execution.runner_take_profit)
+
+    @patch("copytrading.execution._binance_for_user")
+    def test_btc_shorthand_is_scaled_and_minimum_contract_tightens_stop(self, mock_client):
+        mock_client.return_value = (
+            self.account, ContractFakeBinance("79199.8", "50", "0.1")
+        )
+        self.strategy.allocation_usdt = Decimal("5")
+        self.strategy.risk_percent_per_order = Decimal("30")
+        self.strategy.minimum_risk_reward = Decimal("1.5")
+        self.strategy.use_binance_max_leverage = True
+        self.strategy.save()
+
+        _, signal, execution = process_telegram_message(
+            self.strategy, 127, BTC_SHORTHAND_SIGNAL, timezone.now()
+        )
+
+        signal.refresh_from_db()
+        self.assertEqual(signal.entry_low, Decimal("79400"))
+        self.assertEqual(signal.stop_loss, Decimal("81170"))
+        self.assertEqual(execution.status, CopyExecution.Status.PAPER_FILLED)
+        self.assertEqual(execution.quantity, Decimal("0.001"))
+        self.assertEqual(execution.leverage, 16)
+        self.assertEqual(execution.stop_loss, Decimal("80699.8"))
+        self.assertEqual(execution.take_profit, Decimal("76800"))
+        self.assertLessEqual(
+            abs(execution.entry_price - execution.stop_loss) * execution.quantity,
+            Decimal("1.5"),
+        )
+
+    @patch("copytrading.execution._binance_for_user")
+    def test_small_bch_position_uses_full_final_target_instead_of_skipping(self, mock_client):
+        mock_client.return_value = (
+            self.account, ContractFakeBinance("252.79", "20", "0.01")
+        )
+        self.strategy.allocation_usdt = Decimal("5")
+        self.strategy.risk_percent_per_order = Decimal("30")
+        self.strategy.minimum_risk_reward = Decimal("1.5")
+        self.strategy.entry_order_type = CopyStrategy.EntryOrderType.SMART
+        self.strategy.use_binance_max_leverage = True
+        self.strategy.save()
+
+        execution = process_telegram_message(
+            self.strategy, 128, BCH_SMALL_SPLIT_SIGNAL, timezone.now()
+        )[2]
+
+        self.assertEqual(execution.status, CopyExecution.Status.PENDING_ENTRY)
+        self.assertEqual(execution.entry_order_type, CopyStrategy.EntryOrderType.LIMIT)
+        self.assertEqual(execution.limit_price, Decimal("255"))
+        self.assertEqual(execution.take_profit, Decimal("237"))
+        self.assertEqual(execution.tp1_close_percent, Decimal("100"))
+        self.assertIsNone(execution.runner_take_profit)
+
+    @patch("copytrading.execution._binance_for_user")
+    def test_xaut_low_market_rr_becomes_limit_with_full_final_target(self, mock_client):
+        mock_client.return_value = (
+            self.account, ContractFakeBinance("4530.67", "5", "0.01")
+        )
+        self.strategy.allocation_usdt = Decimal("5")
+        self.strategy.risk_percent_per_order = Decimal("30")
+        self.strategy.minimum_risk_reward = Decimal("1.5")
+        self.strategy.entry_order_type = CopyStrategy.EntryOrderType.SMART
+        self.strategy.use_binance_max_leverage = True
+        self.strategy.save()
+
+        execution = process_telegram_message(
+            self.strategy, 129, XAUT_LOW_WEIGHTED_RR_SIGNAL, timezone.now()
+        )[2]
+
+        self.assertEqual(execution.status, CopyExecution.Status.PENDING_ENTRY)
+        self.assertEqual(execution.entry_order_type, CopyStrategy.EntryOrderType.LIMIT)
+        self.assertEqual(execution.limit_price, Decimal("4543.7"))
+        self.assertEqual(execution.take_profit, Decimal("4420"))
+        self.assertEqual(execution.tp1_close_percent, Decimal("100"))
 
     @patch("copytrading.execution._binance_for_user")
     def test_full_plan_rr_includes_tp1_partial_and_final_runner(self, mock_client):

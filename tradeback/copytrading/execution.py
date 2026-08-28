@@ -1,5 +1,5 @@
 from datetime import timedelta
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN
 
 from django.conf import settings
 from django.db import transaction
@@ -32,6 +32,36 @@ def _floor_step(value, step):
     if not step:
         return value
     return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def _ceil_step(value, step):
+    if not step:
+        return value
+    return (value / step).to_integral_value(rounding=ROUND_CEILING) * step
+
+
+def _normalize_signal_price_scale(signal, market_price):
+    """Repair channel shorthand such as BTC 79.400 meaning 79,400 USDT."""
+    market_price = Decimal(str(market_price))
+    midpoint = (signal.entry_low + signal.entry_high) / Decimal("2")
+    if midpoint <= 0 or market_price <= 0:
+        return Decimal("1")
+    original_error = abs(midpoint - market_price) / market_price
+    if original_error < Decimal("0.80"):
+        return Decimal("1")
+    factors = tuple(Decimal(10) ** power for power in range(-6, 7))
+    factor = min(factors, key=lambda candidate: abs(midpoint * candidate - market_price))
+    scaled_error = abs(midpoint * factor - market_price) / market_price
+    if factor == 1 or scaled_error > Decimal("0.20"):
+        return Decimal("1")
+    signal.entry_low *= factor
+    signal.entry_high *= factor
+    signal.stop_loss *= factor
+    signal.take_profits = [
+        decimal_to_string(Decimal(str(target)) * factor) for target in signal.take_profits
+    ]
+    signal.save(update_fields=("entry_low", "entry_high", "stop_loss", "take_profits"))
+    return factor
 
 
 def _tp1_quantity(strategy, total_quantity, entry_price, target_price, context, fallback_full=False):
@@ -83,6 +113,91 @@ def _full_take_profit_plan(
     if risk_amount <= 0:
         raise ValueError("A positive stop-loss risk is required to calculate full-plan R:R.")
     return runner_target, reward_amount / risk_amount
+
+
+def _best_take_profit_plan(strategy, signal, entry_price, stop_loss, total_quantity, context):
+    """Prefer the configured split, then fall back to one executable final target."""
+    minimum_rr = Decimal(str(strategy.minimum_risk_reward))
+    try:
+        tp1_quantity, tp1_percent = _tp1_quantity(
+            strategy, total_quantity, entry_price,
+            Decimal(str(signal.take_profits[0])), context,
+        )
+        runner_target, ratio = _full_take_profit_plan(
+            signal, entry_price, stop_loss, total_quantity, tp1_quantity, tp1_percent,
+        )
+        if ratio >= minimum_rr:
+            return (
+                Decimal(str(signal.take_profits[0])), tp1_quantity,
+                tp1_percent, runner_target, ratio,
+            )
+    except ValueError:
+        pass
+
+    candidates = []
+    risk = abs(entry_price - stop_loss)
+    for raw_target in signal.take_profits:
+        target = Decimal(str(raw_target))
+        valid = (
+            signal.direction == "LONG" and target > entry_price
+        ) or (
+            signal.direction == "SHORT" and target < entry_price
+        )
+        if valid and risk > 0:
+            candidates.append((abs(target - entry_price) / risk, target))
+    if not candidates:
+        raise ValueError("No take-profit remains valid for the executable entry price.")
+    ratio, target = max(candidates, key=lambda item: item[0])
+    return target, total_quantity, Decimal("100"), None, ratio
+
+
+def _minimum_contract_quantity(context, entry_price):
+    step = Decimal(context.get("volume_step") or 0)
+    minimum = Decimal(context.get("min_volume") or 0)
+    min_notional = Decimal(context.get("min_notional") or 0)
+    if min_notional:
+        notional_quantity = min_notional / entry_price
+        minimum = max(minimum, _ceil_step(notional_quantity, step))
+    return max(minimum, step)
+
+
+def _risk_size_with_contract_fallback(
+    strategy, signal, order_price, stop_loss, take_profit, allocation,
+    risk_budget, context, brackets, leverage_cap,
+):
+    payload = {
+        "direction": signal.direction, "entry_price": order_price,
+        "stop_loss": stop_loss, "take_profit": take_profit,
+    }
+    try:
+        return calculate_risk_sized_order(
+            payload, allocation, context, brackets, leverage_cap=leverage_cap,
+            requested_leverage=signal.requested_leverage, risk_budget=risk_budget,
+        ), stop_loss
+    except ValueError as exc:
+        if not (
+            str(exc).startswith("Volume must be at least")
+            or str(exc).startswith("Notional value must be at least")
+        ):
+            raise
+        minimum_quantity = _minimum_contract_quantity(context, order_price)
+        if minimum_quantity <= 0:
+            raise
+        maximum_distance = risk_budget / minimum_quantity
+        original_distance = abs(order_price - stop_loss)
+        if maximum_distance >= original_distance:
+            raise
+        price_step = Decimal(context.get("price_step") or 0)
+        adjusted_stop = (
+            _ceil_step(order_price - maximum_distance, price_step)
+            if signal.direction == "LONG"
+            else _floor_step(order_price + maximum_distance, price_step)
+        )
+        payload["stop_loss"] = adjusted_stop
+        return calculate_risk_sized_order(
+            payload, allocation, context, brackets, leverage_cap=leverage_cap,
+            requested_leverage=signal.requested_leverage, risk_budget=risk_budget,
+        ), adjusted_stop
 
 
 def _limit_price(signal, context):
@@ -299,7 +414,8 @@ def execute_signal(strategy, signal, paper_replay=False):
         except (ExchangeAccount.DoesNotExist, BinanceServiceError) as exc:
             return _skip(strategy, signal, signal.entry_low, str(exc))
 
-    market_price = context["current_price"]
+    market_price = Decimal(str(context["current_price"]))
+    _normalize_signal_price_scale(signal, market_price)
     price = signal.entry_low if paper_replay and strategy.mode == CopyStrategy.Mode.PAPER else market_price
     accepted_low, accepted_high = _accepted_entry_range(strategy, signal)
     if (
@@ -318,12 +434,18 @@ def execute_signal(strategy, signal, paper_replay=False):
             ),
         )
     first_target = Decimal(str(signal.take_profits[0]))
-    risk_structure_valid = (
-        signal.stop_loss < price < first_target
-        if signal.direction == "LONG"
-        else first_target < price < signal.stop_loss
+    stop_crossed = (
+        price <= signal.stop_loss if signal.direction == "LONG" else price >= signal.stop_loss
     )
-    if not paper_replay and not risk_structure_valid:
+    target_crossed = (
+        price >= first_target if signal.direction == "LONG" else price <= first_target
+    )
+    force_limit = (
+        not paper_replay
+        and target_crossed
+        and strategy.entry_order_type == CopyStrategy.EntryOrderType.SMART
+    )
+    if not paper_replay and (stop_crossed or (target_crossed and not force_limit)):
         return _skip(
             strategy,
             signal,
@@ -338,46 +460,55 @@ def execute_signal(strategy, signal, paper_replay=False):
     order_type = _resolve_entry_order_type(
         strategy, signal, price, accepted_low, accepted_high, paper_replay
     )
+    if force_limit:
+        order_type = CopyStrategy.EntryOrderType.LIMIT
     order_price = price if order_type == CopyStrategy.EntryOrderType.MARKET else _limit_price(signal, context)
-    take_profit = Decimal(str(signal.take_profits[0]))
     leverage_cap = (
         125
         if strategy.use_binance_max_leverage else strategy.max_leverage
     )
-    try:
-        sizing = calculate_risk_sized_order(
-            {
-                "direction": signal.direction, "entry_price": order_price,
-                "stop_loss": signal.stop_loss, "take_profit": take_profit,
-            },
-            allocation, context, brackets, leverage_cap=leverage_cap,
-            requested_leverage=signal.requested_leverage,
-            risk_budget=risk_budget,
+
+    def build_order_plan(candidate_price):
+        initial_target = Decimal(str(signal.take_profits[0]))
+        sizing, effective_stop = _risk_size_with_contract_fallback(
+            strategy, signal, candidate_price, signal.stop_loss, initial_target,
+            allocation, risk_budget, context, brackets, leverage_cap,
         )
+        candidate_quantity = Decimal(sizing["volume"])
+        plan = _best_take_profit_plan(
+            strategy, signal, candidate_price, effective_stop,
+            candidate_quantity, context,
+        )
+        return sizing, effective_stop, plan
+
+    try:
+        sizing, stop_loss, plan = build_order_plan(order_price)
     except ValueError as exc:
         return _skip(strategy, signal, price, str(exc))
     leverage = sizing["leverage"]
     quantity = Decimal(sizing["volume"])
-    try:
-        take_profit_quantity, tp1_close_percent = _tp1_quantity(
-            strategy, quantity, order_price, take_profit, context,
-        )
-        runner_take_profit, actual_risk_reward = _full_take_profit_plan(
-            signal, order_price, signal.stop_loss, quantity,
-            take_profit_quantity, tp1_close_percent,
-        )
-    except ValueError as exc:
-        return _skip(strategy, signal, price, str(exc))
-    if actual_risk_reward < Decimal(str(strategy.minimum_risk_reward)):
-        return _skip(
-            strategy, signal, price,
-            (
-                f"Full take-profit plan R:R {decimal_to_string(actual_risk_reward)} is below "
-                f"the configured minimum {decimal_to_string(strategy.minimum_risk_reward)} "
-                f"(TP1 closes {decimal_to_string(tp1_close_percent)}%; the runner uses the "
-                "final target)."
-            ),
-        )
+    take_profit, take_profit_quantity, tp1_close_percent, runner_take_profit, actual_risk_reward = plan
+
+    if (
+        strategy.entry_order_type == CopyStrategy.EntryOrderType.SMART
+        and order_type == CopyStrategy.EntryOrderType.MARKET
+        and actual_risk_reward < Decimal(str(strategy.minimum_risk_reward))
+    ):
+        limit_price = _limit_price(signal, context)
+        try:
+            limit_sizing, limit_stop, limit_plan = build_order_plan(limit_price)
+            if limit_plan[-1] > actual_risk_reward:
+                order_type = CopyStrategy.EntryOrderType.LIMIT
+                order_price = limit_price
+                sizing, stop_loss, plan = limit_sizing, limit_stop, limit_plan
+                leverage = sizing["leverage"]
+                quantity = Decimal(sizing["volume"])
+                (
+                    take_profit, take_profit_quantity, tp1_close_percent,
+                    runner_take_profit, actual_risk_reward,
+                ) = plan
+        except ValueError:
+            pass
 
     limit_marketable = (
         signal.direction == "LONG" and price <= order_price
@@ -392,7 +523,7 @@ def execute_signal(strategy, signal, paper_replay=False):
             position_status=CopyExecution.PositionStatus.OPEN,
             symbol=signal.symbol, direction=signal.direction, entry_price=price,
             quantity=quantity, leverage=leverage, margin_usdt=allocation,
-            stop_loss=signal.stop_loss, take_profit=take_profit,
+            stop_loss=stop_loss, take_profit=take_profit,
             take_profit_quantity=take_profit_quantity, remaining_quantity=quantity,
             tp1_close_percent=tp1_close_percent,
             runner_take_profit=runner_take_profit,
@@ -403,7 +534,7 @@ def execute_signal(strategy, signal, paper_replay=False):
             status=TradeLog.Status.DRAFT, market=TradeLog.Market.FUTURES,
             symbol=signal.symbol, side="BUY" if signal.direction == "LONG" else "SELL",
             price=price, quantity=quantity, quote_quantity=price * quantity,
-            stop_loss=signal.stop_loss, take_profit=take_profit, leverage=leverage,
+            stop_loss=stop_loss, take_profit=take_profit, leverage=leverage,
             note=f"Telegram paper {'replay' if paper_replay else 'copy'}: {strategy.chat_title}",
             executed_at=timezone.now(),
         )
@@ -417,7 +548,7 @@ def execute_signal(strategy, signal, paper_replay=False):
             position_status=CopyExecution.PositionStatus.PENDING,
             symbol=signal.symbol, direction=signal.direction, entry_price=order_price,
             limit_price=order_price, quantity=quantity, leverage=leverage,
-            margin_usdt=allocation, stop_loss=signal.stop_loss, take_profit=take_profit,
+            margin_usdt=allocation, stop_loss=stop_loss, take_profit=take_profit,
             take_profit_quantity=take_profit_quantity, remaining_quantity=quantity,
             tp1_close_percent=tp1_close_percent,
             runner_take_profit=runner_take_profit,
@@ -440,7 +571,7 @@ def execute_signal(strategy, signal, paper_replay=False):
         strategy=strategy, signal=signal, status=CopyExecution.Status.SUBMITTED,
         symbol=signal.symbol, direction=signal.direction, entry_price=price,
         quantity=quantity, leverage=leverage, margin_usdt=allocation,
-        stop_loss=signal.stop_loss, take_profit=take_profit,
+        stop_loss=stop_loss, take_profit=take_profit,
         take_profit_quantity=take_profit_quantity, remaining_quantity=quantity,
         tp1_close_percent=tp1_close_percent,
         runner_take_profit=runner_take_profit,
@@ -494,7 +625,7 @@ def execute_signal(strategy, signal, paper_replay=False):
         execution.position_status = CopyExecution.PositionStatus.OPEN
         stop = client.place_futures_algo_order(
             algoType="CONDITIONAL", symbol=signal.symbol, side=closing_side,
-            type="STOP_MARKET", triggerPrice=decimal_to_string(signal.stop_loss),
+            type="STOP_MARKET", triggerPrice=decimal_to_string(stop_loss),
             quantity=decimal_to_string(quantity), reduceOnly="true", workingType="MARK_PRICE",
         )
         execution.stop_order_id = str(stop.get("algoId", ""))
@@ -557,10 +688,13 @@ def protect_live_execution(
     execution.status = CopyExecution.Status.SUBMITTED
     try:
         context = client.get_symbol_context(execution.symbol, include_symbols=False)
-        take_profit_quantity, tp1_close_percent = _tp1_quantity(
-            execution.strategy, guarded_quantity, average_price, execution.take_profit,
-            context, fallback_full=True,
-        )
+        if execution.tp1_close_percent >= Decimal("100"):
+            take_profit_quantity, tp1_close_percent = guarded_quantity, Decimal("100")
+        else:
+            take_profit_quantity, tp1_close_percent = _tp1_quantity(
+                execution.strategy, guarded_quantity, average_price, execution.take_profit,
+                context, fallback_full=True,
+            )
     except BinanceServiceError:
         # The entry is already open: retain full-size TP protection if symbol metadata
         # cannot be refreshed instead of leaving the position unprotected.
