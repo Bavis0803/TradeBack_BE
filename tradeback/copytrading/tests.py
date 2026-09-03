@@ -5,11 +5,13 @@ from unittest.mock import patch
 from asgiref.sync import async_to_sync
 from django.contrib.auth import get_user_model
 from django.core.files.base import ContentFile
+from django.core.cache import cache
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
 from exchanges.models import ExchangeAccount, ExchangeCredential, TradeLog
+from exchanges.services import BinanceService
 
 from .execution import process_telegram_message, reprocess_saved_message
 from .ai_detection import is_ai_candidate
@@ -192,6 +194,114 @@ class ContractFakeBinance(FakeBinance):
             "initial_leverage": 125, "notional_floor": Decimal("0"),
             "notional_cap": Decimal("1000000"), "maint_margin_ratio": Decimal("0.004"),
         }]
+
+
+class CopyPositionSyncTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = get_user_model().objects.create_user(username="sync-regression")
+        connection = TelegramConnection.objects.create(
+            user=self.user, api_id=123, api_hash="test", session="test",
+        )
+        self.strategy = CopyStrategy.objects.create(
+            user=self.user, telegram_connection=connection, chat_id=-100123,
+            mode="LIVE", allocation_usdt=5, max_daily_loss_usdt=50,
+        )
+        _, signal, _ = process_telegram_message(
+            self.strategy, 1, CHN_SIGNAL, timezone.now(), execute=False,
+        )
+        self.execution = CopyExecution.objects.create(
+            strategy=self.strategy, signal=signal, symbol="ZECUSDT", direction="LONG",
+            status="PROTECTED", position_status="OPEN", entry_price=Decimal("521.5"),
+            quantity=Decimal("0.1"), remaining_quantity=Decimal("0.1"), leverage=10,
+            margin_usdt=5, stop_loss=497, take_profit=571, tp1_close_percent=100,
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+        self.service = BinanceService("sync-test-key", "test-secret")
+        self.patchers = [
+            patch("copytrading.positions._binance_for_user", return_value=(None, self.service)),
+            patch("copytrading.positions.BinanceService.get_futures_mark_prices", return_value={"ZECUSDT": Decimal("522")}),
+        ]
+        for patcher in self.patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.row = {
+            "symbol": "ZECUSDT", "positionAmt": "0.1", "entryPrice": "521.5",
+            "markPrice": "522", "unRealizedProfit": "0.05",
+        }
+
+    @patch.object(BinanceService, "_request_json")
+    def test_positions_api_accepts_real_v3_schema_without_leverage(self, request):
+        request.side_effect = [[self.row], [{"symbol": "ZECUSDT", "leverage": 12}]]
+        response = self.client.get("/copy-trading/positions/")
+        self.assertEqual(response.status_code, 200)
+        position = response.data["open"][0]
+        self.assertEqual(position["leverage"], 12)
+        self.assertEqual(position["leverage_source"], "BINANCE_CONFIG")
+        self.assertEqual(position["unrealized_pnl"], "0.05")
+        self.assertEqual(position["sync_status"], "CONFIRMED")
+
+    @patch.object(BinanceService, "get_futures_positions")
+    def test_missing_and_invalid_optional_numbers_do_not_break_the_list(self, positions):
+        for bad in (None, "", "bad", "NaN", "Infinity"):
+            with self.subTest(bad=bad):
+                positions.return_value = [{
+                    **self.row, "entryPrice": bad, "markPrice": bad,
+                    "unRealizedProfit": bad, "leverage": bad,
+                }]
+                response = self.client.get("/copy-trading/positions/")
+                self.assertEqual(response.status_code, 200)
+                position = response.data["open"][0]
+                self.assertEqual(position["leverage"], 10)
+                self.assertEqual(position["leverage_source"], "STORED_ORDER")
+                self.assertEqual(position["entry_price"], "521.5")
+                self.assertEqual(position["mark_price"], "522")
+                self.assertEqual(position["unrealized_pnl"], "0.05")
+                self.assertEqual(position["pnl_source"], "CALCULATED")
+
+    @patch.object(BinanceService, "get_futures_positions")
+    def test_incomplete_snapshot_does_not_mark_a_position_closed(self, positions):
+        self.execution.binance_missing_since = timezone.now() - timedelta(minutes=10)
+        self.execution.save(update_fields=("binance_missing_since",))
+        for malformed in ([{**self.row, "positionAmt": None}], [{**self.row, "positionAmt": "NaN"}], [None], {"code": -1}):
+            with self.subTest(snapshot=malformed):
+                positions.return_value = malformed
+                with self.assertLogs("copytrading.positions", level="ERROR"):
+                    response = self.client.get("/copy-trading/positions/")
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.data["sync_error"])
+                self.assertEqual(response.data["open"][0]["sync_status"], "RECONNECTING")
+                self.execution.refresh_from_db()
+                self.assertEqual(self.execution.position_status, "OPEN")
+
+    @patch("copytrading.positions.reconcile_live_protections", side_effect=RuntimeError("test reconciliation failure"))
+    @patch.object(BinanceService, "get_futures_positions", return_value=[])
+    def test_failed_reconciliation_cannot_turn_success_flag_into_false_close(self, positions, reconcile):
+        self.execution.binance_missing_since = timezone.now() - timedelta(minutes=10)
+        self.execution.save(update_fields=("binance_missing_since",))
+        with self.assertLogs("copytrading.positions", level="ERROR"):
+            response = self.client.get("/copy-trading/positions/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data["open"]), 1)
+        self.execution.refresh_from_db()
+        self.assertEqual(self.execution.position_status, "OPEN")
+
+    @patch.object(BinanceService, "get_futures_positions")
+    def test_two_positions_remain_visible_when_one_lacks_optional_fields(self, positions):
+        _, signal, _ = process_telegram_message(
+            self.strategy, 2, BCH_SMALL_SPLIT_SIGNAL, timezone.now(), execute=False,
+        )
+        CopyExecution.objects.create(
+            strategy=self.strategy, signal=signal, symbol="BCHUSDT", direction="SHORT",
+            status="PROTECTED", position_status="OPEN", entry_price=255, quantity=Decimal("0.1"),
+            remaining_quantity=Decimal("0.1"), leverage=9, margin_usdt=5,
+            stop_loss=264, take_profit=237, tp1_close_percent=100,
+        )
+        positions.return_value = [self.row, {"symbol": "BCHUSDT", "positionAmt": "-0.1"}]
+        response = self.client.get("/copy-trading/positions/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual({row["symbol"] for row in response.data["open"]}, {"ZECUSDT", "BCHUSDT"})
 
 
 class CopyExecutionTests(TestCase):

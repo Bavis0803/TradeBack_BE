@@ -1,13 +1,28 @@
 import hashlib
 import hmac
 import json
+import logging
 import time
-from decimal import Decimal, ROUND_CEILING, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_DOWN
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from django.core.cache import cache
+
+
+logger = logging.getLogger(__name__)
+
+
+def valid_leverage(value):
+    """Only accept finite positive integers from optional Binance fields."""
+    try:
+        number = Decimal(str(value))
+        if number.is_finite() and 0 < number <= 125 and number == number.to_integral_value():
+            return int(number)
+    except (InvalidOperation, TypeError, ValueError):
+        pass
+    return None
 
 
 class BinanceServiceError(Exception):
@@ -99,6 +114,8 @@ class BinanceService:
             raise BinanceServiceError(f"Binance API error: {message}", code=error_code) from error
         except (URLError, TimeoutError) as error:
             raise BinanceServiceError("Unable to reach Binance. Please try again.") from error
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise BinanceServiceError("Binance returned an unreadable response. Please retry.") from error
 
     def _sync_server_time(self, base_url=None, time_path="/fapi/v1/time"):
         request_base_url = base_url or self.base_url
@@ -208,7 +225,60 @@ class BinanceService:
         }
 
     def get_futures_positions(self):
-        return self._request_json("/fapi/v3/positionRisk", signed=True)
+        rows = self._request_json("/fapi/v3/positionRisk", signed=True)
+        if not isinstance(rows, list):
+            raise BinanceServiceError("Binance returned an invalid position snapshot; retrying sync.")
+        # V3 does not include leverage. Fetch account configuration once, not once
+        # per symbol, and never discard usable positions if configuration is down.
+        config = self.get_futures_symbol_config() if any(
+            isinstance(row, dict) and valid_leverage(row.get("leverage")) is None
+            for row in rows
+        ) else {}
+        result = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise BinanceServiceError("Binance returned an invalid position row; retrying sync.")
+            item = dict(row)
+            leverage = valid_leverage(item.get("leverage"))
+            source = "BINANCE_POSITION"
+            if leverage is None:
+                leverage = valid_leverage(config.get(item.get("symbol"), {}).get("leverage"))
+                source = "BINANCE_CONFIG"
+            item["leverage"] = leverage
+            item["leverage_source"] = source if leverage is not None else "UNAVAILABLE"
+            result.append(item)
+        return result
+
+    def _symbol_config_cache_key(self):
+        identity = hashlib.sha256(f"{self.base_url}:{self.api_key}".encode()).hexdigest()
+        return f"binance-symbol-config:v1:{identity}"
+
+    def get_futures_symbol_config(self):
+        key = self._symbol_config_cache_key()
+        config = cache.get(key)
+        if config is not None:
+            return config
+        # API requests and the Telegram worker share this lock through Redis.
+        if not cache.add(f"{key}:lock", True, timeout=15):
+            return {}
+        try:
+            rows = self._request_json("/fapi/v1/symbolConfig", signed=True)
+            if not isinstance(rows, list):
+                raise BinanceServiceError("Invalid Binance symbol configuration response.")
+            config = {
+                row["symbol"]: {"leverage": valid_leverage(row.get("leverage"))}
+                for row in rows if isinstance(row, dict) and row.get("symbol")
+            }
+            cache.set(key, config, timeout=60)
+            return config
+        except BinanceServiceError:
+            # Back off on an unavailable optional endpoint instead of hitting it
+            # at every positions poll. The serializer labels stored leverage.
+            logger.warning("Binance symbol configuration unavailable; using stored leverage temporarily.")
+            cache.set(key, {}, timeout=15)
+            return {}
+        finally:
+            cache.delete(f"{key}:lock")
 
     def get_spot_account(self):
         return self._request_json(
@@ -334,12 +404,14 @@ class BinanceService:
         ]
 
     def change_initial_leverage(self, symbol, leverage):
-        return self._request_json(
+        result = self._request_json(
             "/fapi/v1/leverage",
             {"symbol": symbol, "leverage": int(leverage)},
             signed=True,
             method="POST",
         )
+        cache.delete(self._symbol_config_cache_key())
+        return result
 
     def place_futures_order(self, **params):
         return self._request_json(

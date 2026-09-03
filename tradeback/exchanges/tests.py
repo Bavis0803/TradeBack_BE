@@ -17,7 +17,7 @@ from .models import (
     TradeLog,
     TradeSyncState,
 )
-from .services import BinanceService, calculate_risk_reward, calculate_risk_sized_order
+from .services import BinanceService, BinanceServiceError, calculate_risk_reward, calculate_risk_sized_order
 
 
 def symbol_context():
@@ -202,6 +202,76 @@ class CalculatorDomainTests(SimpleTestCase):
         self.assertLessEqual(Decimal(result["risk_amount"]), Decimal("1"))
         self.assertLessEqual(Decimal(result["margin_required"]), Decimal("5"))
         self.assertEqual(result["risk_budget"], "1")
+
+
+class BinancePositionConfigurationTests(SimpleTestCase):
+    def setUp(self):
+        cache.clear()
+        self.service = BinanceService("position-test-key", "test-secret")
+        self.rows = [{"symbol": "BTCUSDT", "positionAmt": "0.001", "entryPrice": "79000"}]
+
+    @patch.object(BinanceService, "_request_json")
+    def test_v3_positions_are_enriched_and_configuration_is_cached(self, request):
+        request.side_effect = [self.rows, [{"symbol": "BTCUSDT", "leverage": 16}], self.rows]
+        first = self.service.get_futures_positions()
+        second = self.service.get_futures_positions()
+        self.assertEqual(first[0]["leverage"], 16)
+        self.assertEqual(first[0]["leverage_source"], "BINANCE_CONFIG")
+        self.assertEqual(second, first)
+        self.assertNotIn("leverage", self.rows[0])
+        self.assertEqual(request.call_count, 3)
+
+    @patch.object(BinanceService, "_request_json")
+    def test_unavailable_configuration_does_not_hide_positions_and_backs_off(self, request):
+        request.side_effect = [self.rows, BinanceServiceError("unavailable"), self.rows]
+        first = self.service.get_futures_positions()
+        self.assertEqual(first[0]["symbol"], "BTCUSDT")
+        self.assertIsNone(first[0]["leverage"])
+        self.assertEqual(self.service.get_futures_positions(), first)
+        self.assertEqual(request.call_count, 3)
+
+    @patch.object(BinanceService, "_request_json")
+    def test_configuration_cache_is_isolated_by_account_and_environment(self, request):
+        request.return_value = [{"symbol": "BTCUSDT", "leverage": 16}]
+        self.service.get_futures_symbol_config()
+        BinanceService("other-key", "secret").get_futures_symbol_config()
+        BinanceService("position-test-key", "secret", testnet=True).get_futures_symbol_config()
+        self.assertEqual(request.call_count, 3)
+        self.assertNotIn("position-test-key", self.service._symbol_config_cache_key())
+
+    @patch.object(BinanceService, "_request_json")
+    def test_changing_leverage_invalidates_cached_configuration(self, request):
+        request.side_effect = [
+            [{"symbol": "BTCUSDT", "leverage": 16}], {"leverage": 8},
+            [{"symbol": "BTCUSDT", "leverage": 8}],
+        ]
+        self.service.get_futures_symbol_config()
+        self.service.change_initial_leverage("BTCUSDT", 8)
+        self.assertEqual(self.service.get_futures_symbol_config()["BTCUSDT"]["leverage"], 8)
+
+    @patch.object(BinanceService, "_request_json")
+    def test_existing_leverage_and_empty_positions_need_no_configuration_call(self, request):
+        request.side_effect = [[{**self.rows[0], "leverage": "12"}], []]
+        self.assertEqual(self.service.get_futures_positions()[0]["leverage"], 12)
+        self.assertEqual(self.service.get_futures_positions(), [])
+        self.assertEqual(request.call_count, 2)
+
+    @patch.object(BinanceService, "_request_json")
+    def test_invalid_leverages_are_not_treated_as_real_configuration(self, request):
+        for invalid in (None, "", "NaN", "Infinity", "x", "0", "-1", "3.5"):
+            with self.subTest(invalid=invalid):
+                cache.clear()
+                request.side_effect = [
+                    [{**self.rows[0], "leverage": invalid}],
+                    [{"symbol": "BTCUSDT", "leverage": invalid}],
+                ]
+                self.assertIsNone(self.service.get_futures_positions()[0]["leverage"])
+
+    @patch.object(BinanceService, "_request_json")
+    def test_parallel_configuration_refresh_uses_stored_fallback_without_extra_request(self, request):
+        cache.set(f"{self.service._symbol_config_cache_key()}:lock", True, 15)
+        self.assertEqual(self.service.get_futures_symbol_config(), {})
+        request.assert_not_called()
 
 
 class RiskRewardAPITests(TestCase):

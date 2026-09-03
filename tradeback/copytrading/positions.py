@@ -1,14 +1,28 @@
-from decimal import Decimal
+import logging
+from decimal import Decimal, InvalidOperation
 from datetime import timedelta
 
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
-from exchanges.services import BinanceService, BinanceServiceError, decimal_to_string
+from exchanges.services import BinanceService, BinanceServiceError, decimal_to_string, valid_leverage
 
 from .execution import _binance_for_user, _floor_step, protect_live_execution
 from .models import CopyExecution, CopyStrategy
+
+
+logger = logging.getLogger(__name__)
+
+
+def _finite_decimal(value, fallback=None, positive=False):
+    try:
+        number = Decimal(str(value))
+        if number.is_finite() and (not positive or number > 0):
+            return number
+    except (InvalidOperation, ValueError, TypeError):
+        pass
+    return fallback
 
 
 def _pnl(execution, price, quantity=None):
@@ -22,11 +36,19 @@ def _position_direction(amount):
 
 
 def _live_position_map(client):
-    return {
-        (item["symbol"], _position_direction(item.get("positionAmt", "0"))): item
-        for item in client.get_futures_positions()
-        if Decimal(str(item.get("positionAmt", "0"))) != 0
-    }
+    rows = client.get_futures_positions()
+    if not isinstance(rows, list):
+        raise BinanceServiceError("Invalid Binance position snapshot; keeping stored positions.")
+    positions = {}
+    for item in rows:
+        amount = _finite_decimal(item.get("positionAmt")) if isinstance(item, dict) else None
+        if amount is None or not isinstance(item.get("symbol"), str) or not item["symbol"]:
+            # An incomplete snapshot must NEVER be treated as confirmation that
+            # another position has disappeared and should be marked closed.
+            raise BinanceServiceError("Incomplete Binance position snapshot; keeping stored positions.")
+        if amount != 0:
+            positions[(item["symbol"], _position_direction(amount))] = item
+    return positions
 
 
 def _live_close_details(execution, client, fallback_price):
@@ -432,6 +454,7 @@ def get_position_payload(user, strategy_id=None):
 
     live_positions = {}
     live_sync_ok = False
+    live_sync_error = ""
     if any(item.strategy.mode == CopyStrategy.Mode.LIVE for item in open_rows):
         try:
             _, client = _binance_for_user(user)
@@ -442,7 +465,10 @@ def get_position_payload(user, strategy_id=None):
                 if execution.pk in changed:
                     execution.refresh_from_db()
         except Exception:
+            logger.exception("Unable to refresh copy position snapshot for user %s", user.pk)
             live_positions = {}
+            live_sync_ok = False
+            live_sync_error = "Binance position data is temporarily unavailable; showing stored positions and mark prices."
 
     snapshots = []
     now = timezone.now()
@@ -457,7 +483,15 @@ def get_position_payload(user, strategy_id=None):
             live_positions.get((execution.symbol, execution.direction))
             if execution.strategy.mode == CopyStrategy.Mode.LIVE else None
         )
-        mark = Decimal(str(live.get("markPrice"))) if live else marks.get(execution.symbol, execution.entry_price)
+        fallback_mark = _finite_decimal(marks.get(execution.symbol), execution.entry_price, positive=True)
+        mark = _finite_decimal(live.get("markPrice"), fallback_mark, positive=True) if live else fallback_mark
+        if (
+            execution.strategy.mode == CopyStrategy.Mode.LIVE and not live_sync_ok
+            and execution.binance_missing_since is not None
+        ):
+            # An outage interrupts the continuous-missing grace period.
+            execution.binance_missing_since = None
+            execution.save(update_fields=("binance_missing_since", "updated_at"))
         if execution.strategy.mode == CopyStrategy.Mode.LIVE and live_sync_ok:
             if live is not None:
                 if execution.binance_missing_since is not None or execution.last_binance_seen_at is None:
@@ -486,29 +520,40 @@ def get_position_payload(user, strategy_id=None):
                     execution = close_paper_position(execution, *trigger)
                     recent_rows.insert(0, execution)
                     continue
-        snapshots.append(_serialize(execution, mark, live))
+        snapshot = _serialize(execution, mark, live)
+        if execution.strategy.mode == CopyStrategy.Mode.LIVE and not live_sync_ok:
+            snapshot["sync_status"] = "RECONNECTING"
+        snapshots.append(snapshot)
 
     return {
         "pending": [_serialize(item, item.limit_price or item.entry_price) for item in pending_rows],
         "open": snapshots,
         "recent": [_serialize(item, item.exit_price or item.entry_price) for item in recent_rows[:10]],
         "updated_at": timezone.now().isoformat(),
+        "sync_error": live_sync_error,
     }
 
 
 def _serialize(execution, mark_price, live=None):
-    entry = Decimal(str(live.get("entryPrice"))) if live else execution.entry_price
-    quantity = abs(Decimal(str(live.get("positionAmt")))) if live else (
-        execution.remaining_quantity or execution.quantity
+    values = live or {}
+    mark_price = _finite_decimal(mark_price, execution.entry_price, positive=True)
+    entry = _finite_decimal(values.get("entryPrice"), execution.entry_price, positive=True)
+    quantity = abs(_finite_decimal(
+        values.get("positionAmt"), execution.remaining_quantity or execution.quantity,
+    ))
+    estimated_pnl = (
+        (mark_price - entry) * quantity * (1 if execution.direction == "LONG" else -1)
+        if execution.position_status == CopyExecution.PositionStatus.OPEN else execution.realized_pnl
     )
-    pnl = Decimal(str(live.get("unRealizedProfit", "0"))) if live else (
-        _pnl(execution, mark_price, quantity)
-        if execution.position_status == CopyExecution.PositionStatus.OPEN
-        else execution.realized_pnl
-    )
+    pnl = _finite_decimal(values.get("unRealizedProfit"), estimated_pnl)
     margin = execution.margin_usdt
     roe = pnl / margin * Decimal("100") if margin else Decimal("0")
-    leverage = int(live.get("leverage")) if live else execution.leverage
+    live_leverage = valid_leverage(values.get("leverage"))
+    leverage = live_leverage or valid_leverage(execution.leverage) or 1
+    leverage_source = (
+        values.get("leverage_source") or "BINANCE_POSITION"
+        if live_leverage is not None else "STORED_ORDER"
+    )
     active_stop_loss = entry if execution.break_even_activated_at else execution.stop_loss
     risk_amount = abs(entry - active_stop_loss) * quantity
     tp1_quantity = min(execution.take_profit_quantity or quantity, quantity)
@@ -531,6 +576,8 @@ def _serialize(execution, mark_price, live=None):
         "exit_price": decimal_to_string(execution.exit_price) if execution.exit_price else None,
         "quantity": decimal_to_string(quantity),
         "leverage": leverage,
+        "leverage_source": leverage_source,
+        "pnl_source": "BINANCE_ACCOUNT" if _finite_decimal(values.get("unRealizedProfit")) is not None else "CALCULATED",
         "margin_usdt": decimal_to_string(margin),
         "notional_usdt": decimal_to_string(mark_price * quantity),
         "unrealized_pnl": decimal_to_string(pnl),
