@@ -1,6 +1,7 @@
 from datetime import timedelta
 from decimal import Decimal
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from asgiref.sync import async_to_sync
 from django.contrib.auth import get_user_model
@@ -20,7 +21,7 @@ from .models import (
     SignalCandidate, TelegramConnection, TelegramMessage,
 )
 from .parser import SignalParseError, parse_signal, parse_signal_candidate
-from .telegram import chat_reference_candidates, get_strategy_telegram_connection
+from .telegram import _catch_up, chat_reference_candidates, get_strategy_telegram_connection
 from .positions import (
     get_position_payload, reconcile_live_protections, reconcile_pending_entries,
 )
@@ -1383,3 +1384,66 @@ class CopyTradingAPITests(TestCase):
         self.assertEqual(strategy.max_leverage, 7)
         self.assertEqual(strategy.entry_tolerance_percent, Decimal("0.450"))
         self.assertEqual(strategy.status, CopyStrategy.Status.PAUSED)
+
+
+class TelegramCatchUpTests(SimpleTestCase):
+    def test_catch_up_streams_every_missed_message_and_reuses_entity(self):
+        now = timezone.now()
+        strategy = SimpleNamespace(
+            id="strategy-1",
+            chat_id=-100123,
+            chat_username="group-name",
+            last_message_id=100,
+            last_error="Previous flood wait",
+            asave=AsyncMock(),
+        )
+        connection = SimpleNamespace(id=1)
+
+        class FakeClient:
+            def __init__(self):
+                self.get_entity = AsyncMock(return_value="cached-entity")
+                self.calls = []
+
+            def iter_messages(self, entity, **kwargs):
+                self.calls.append((entity, kwargs))
+
+                async def rows():
+                    if len(self.calls) == 1:
+                        for message_id in range(101, 351):
+                            yield SimpleNamespace(id=message_id, date=now)
+
+                return rows()
+
+        client = FakeClient()
+        entity_cache = {}
+        retry_after = {}
+        process_item = AsyncMock(return_value=(SimpleNamespace(), None, None))
+
+        async def run_test():
+            with (
+                patch(
+                    "copytrading.telegram._active_strategies",
+                    new=AsyncMock(return_value=[strategy]),
+                ),
+                patch(
+                    "copytrading.telegram._backfill_recent_media",
+                    new=AsyncMock(),
+                ),
+                patch("copytrading.telegram._process_item", new=process_item),
+            ):
+                await _catch_up(
+                    client, connection, entity_cache=entity_cache, retry_after=retry_after
+                )
+                await _catch_up(
+                    client, connection, entity_cache=entity_cache, retry_after=retry_after
+                )
+
+        async_to_sync(run_test)()
+
+        self.assertEqual(process_item.await_count, 250)
+        self.assertEqual(client.get_entity.await_count, 1)
+        self.assertEqual(client.get_entity.await_args.args, (-100123,))
+        self.assertEqual(client.calls[0][1]["min_id"], 100)
+        self.assertTrue(client.calls[0][1]["reverse"])
+        self.assertIsNone(client.calls[0][1]["limit"])
+        self.assertEqual(strategy.last_error, "")

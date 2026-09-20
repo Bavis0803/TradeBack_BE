@@ -263,40 +263,100 @@ async def _backfill_recent_media(client, strategy, entity):
             await _process_item(client, strategy, item, execute=False)
 
 
-async def _catch_up(client, connection, on_processed=None):
+async def _strategy_entity(client, strategy, entity_cache):
+    cache_key = str(strategy.id)
+    if cache_key not in entity_cache:
+        # Prefer the immutable numeric peer id. Resolving a username on every
+        # reconciliation issues ResolveUsernameRequest and quickly hits
+        # Telegram flood limits.
+        entity_cache[cache_key] = await client.get_entity(
+            strategy.chat_id or strategy.chat_username
+        )
+    return entity_cache[cache_key]
+
+
+async def _catch_up(
+    client,
+    connection,
+    on_processed=None,
+    entity_cache=None,
+    retry_after=None,
+):
     """Persist messages missed while the worker was stopped or reconnecting."""
+    entity_cache = entity_cache if entity_cache is not None else {}
+    retry_after = retry_after if retry_after is not None else {}
+    loop = asyncio.get_running_loop()
     for strategy in await _active_strategies(connection):
+        strategy_key = str(strategy.id)
+        if retry_after.get(strategy_key, 0) > loop.time():
+            continue
         try:
-            entity = await client.get_entity(strategy.chat_username or strategy.chat_id)
+            entity = await _strategy_entity(client, strategy, entity_cache)
             await _backfill_recent_media(client, strategy, entity)
-            missed = [
-                item async for item in client.iter_messages(
-                    entity, min_id=strategy.last_message_id or 0, limit=100
-                )
-            ]
-            for item in reversed(missed):
+            # Telethon handles pagination internally. Streaming oldest-first
+            # avoids the previous 100-message ceiling and advances the cursor
+            # safely after every persisted item, so an interrupted catch-up can
+            # resume without skipping a page.
+            async for item in client.iter_messages(
+                entity,
+                min_id=strategy.last_message_id or 0,
+                reverse=True,
+                limit=None,
+            ):
                 age = timezone.now() - item.date
                 execute = age <= timedelta(seconds=settings.COPY_TRADING_SIGNAL_MAX_AGE_SECONDS)
                 result = await _process_item(client, strategy, item, execute=execute)
                 if on_processed:
                     await on_processed(strategy, *result)
+            retry_after.pop(strategy_key, None)
+            if strategy.last_error:
+                strategy.last_error = ""
+                await strategy.asave(update_fields=("last_error", "updated_at"))
+        except FloodWaitError as exc:
+            retry_after[strategy_key] = loop.time() + exc.seconds + 1
+            strategy.last_error = (
+                f"Telegram rate limit; catch-up retries in {exc.seconds} seconds."
+            )[:500]
+            await strategy.asave(update_fields=("last_error", "updated_at"))
+            logger.warning(
+                "Telegram catch-up rate-limited for strategy %s; retrying after %s seconds.",
+                strategy.id,
+                exc.seconds,
+            )
         except Exception as exc:
             strategy.last_error = f"Telegram catch-up failed: {exc}"[:500]
             await strategy.asave(update_fields=("last_error", "updated_at"))
             logger.exception("Telegram catch-up failed for strategy %s.", strategy.id)
 
 
-async def _reconcile_loop(client, connection, on_processed):
+async def _reconcile_loop(
+    client,
+    connection,
+    on_processed,
+    entity_cache,
+    catch_up_retry_after,
+):
     from .positions import reconcile_live_protections, reconcile_pending_entries
     ticks = 0
+    catch_up_ticks = max(
+        5,
+        settings.COPY_TRADING_CATCH_UP_INTERVAL_SECONDS // 2,
+    )
     while client.is_connected():
         await asyncio.sleep(2)
         try:
             await sync_to_async(reconcile_pending_entries, thread_sensitive=True)(connection.user)
             await sync_to_async(reconcile_live_protections, thread_sensitive=True)(connection.user)
             ticks += 1
+            if ticks % catch_up_ticks == 0:
+                await _catch_up(
+                    client,
+                    connection,
+                    on_processed,
+                    entity_cache,
+                    catch_up_retry_after,
+                )
             if ticks % 10 == 0:
-                await _catch_up(client, connection, on_processed)
                 await sync_to_async(get_position_payload, thread_sensitive=True)(connection.user)
         except Exception:
             logger.exception(
@@ -326,8 +386,24 @@ async def listen_connection(connection, on_processed=None):
     if not await client.is_user_authorized():
         await client.disconnect()
         raise ValueError("Telegram session is no longer authorized.")
-    await _catch_up(client, connection, on_processed)
-    reconcile_task = asyncio.create_task(_reconcile_loop(client, connection, on_processed))
+    entity_cache = {}
+    catch_up_retry_after = {}
+    await _catch_up(
+        client,
+        connection,
+        on_processed,
+        entity_cache,
+        catch_up_retry_after,
+    )
+    reconcile_task = asyncio.create_task(
+        _reconcile_loop(
+            client,
+            connection,
+            on_processed,
+            entity_cache,
+            catch_up_retry_after,
+        )
+    )
     try:
         await client.run_until_disconnected()
     finally:
